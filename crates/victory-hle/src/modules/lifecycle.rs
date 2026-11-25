@@ -74,6 +74,7 @@ pub extern "system" fn CreateWindowExW(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (ex_style, style, show) = quiet(ex_style, style);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -81,6 +82,9 @@ pub extern "system" fn CreateWindowExW(
         )
     };
     hook(hwnd);
+    if show {
+        ShowWindow(hwnd, wm::SW_SHOW);
+    }
     hwnd
 }
 
@@ -100,6 +104,7 @@ pub extern "system" fn CreateWindowExA(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (ex_style, style, show) = quiet(ex_style, style);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -107,7 +112,37 @@ pub extern "system" fn CreateWindowExA(
         )
     };
     hook(hwnd);
+    if show {
+        ShowWindow(hwnd, wm::SW_SHOW);
+    }
     hwnd
+}
+
+/// In a background run (`victory_gpu::background`) a title window never
+/// becomes the active one: its styles with `WS_EX_NOACTIVATE` and without
+/// `WS_VISIBLE`, and whether to show it (our [`ShowWindow`]) once made.
+fn quiet(ex_style: u32, style: u32) -> (u32, u32, bool) {
+    if !victory_gpu::background() {
+        return (ex_style, style, false);
+    }
+    (
+        ex_style | wm::WS_EX_NOACTIVATE,
+        style & !wm::WS_VISIBLE,
+        style & wm::WS_VISIBLE != 0,
+    )
+}
+
+/// The host's, except in a background run: there every way of showing a
+/// window shows it where it is in the window order, not activated.
+pub extern "system" fn ShowWindow(hwnd: HWND, command: i32) -> i32 {
+    let command = match command {
+        wm::SW_HIDE | wm::SW_MINIMIZE | wm::SW_SHOWMINNOACTIVE | wm::SW_FORCEMINIMIZE => command,
+        wm::SW_SHOWMINIMIZED if victory_gpu::background() => wm::SW_SHOWMINNOACTIVE,
+        _ if victory_gpu::background() => wm::SW_SHOWNOACTIVATE,
+        _ => command,
+    };
+    // SAFETY: the title's own call, forwarded.
+    unsafe { wm::ShowWindow(hwnd, command) }
 }
 
 /// A console title sizes its window to its render target (
@@ -305,6 +340,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(UnregisterAppStateChangeNotification),
             hle_export!(CreateWindowExW),
             hle_export!(CreateWindowExA),
+            hle_export!(ShowWindow),
         ],
     }
 }

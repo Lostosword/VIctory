@@ -47,6 +47,12 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
+    if n == WHITE.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    if n == ASKED.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
     named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
 
@@ -121,13 +127,28 @@ fn world_on() -> bool {
 }
 
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
+/// The frame listed because one shown just before was all but white
+/// ([`black`] looks at the probe); a few times a run.
+static WHITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The frame listed because `VICTORY_LIST_ASK` (a file) was found: the one
+/// after the frame it was found at. The file is removed.
+static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// At the present of `frame`: the draws run on the host so far.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
+    static ASK: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+    if let Some(file) = ASK.get_or_init(|| std::env::var_os("VICTORY_LIST_ASK"))
+        && std::fs::remove_file(file).is_ok()
+    {
+        tracing::info!(frame = frame + 1, "frame asked for: listed");
+        ASKED.store(frame + 1, Relaxed);
+    }
     if world_on()
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
@@ -184,11 +205,10 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     header.extend(h.to_be_bytes());
     header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
     chunk(&mut png, b"IHDR", &header);
-    chunk(
-        &mut png,
-        b"IDAT",
-        &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 3),
-    );
+    let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
+    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, &raw, zlib_rs::DeflateConfig::new(3));
+    debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
+    chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
     let path = folder.join(format!("{name}.png"));
     match std::fs::write(&path, png) {
@@ -340,6 +360,231 @@ pub(crate) fn save_read_back(
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// Diagnostics (`VICTORY_SNAP=<hash>`): the textures a dispatch of that
+/// shader names, copied just before and just after it, and logged with the
+/// frame's targets.
+static SNAPS: std::sync::Mutex<Vec<(u64, String, ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)>> =
+    std::sync::Mutex::new(Vec::new());
+
+thread_local! {
+    /// The textures the bind under way names (read, written), if noted.
+    pub(crate) static SNAPPED: std::cell::RefCell<Option<Vec<(usize, u32)>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn snap_wanted(name: &str) -> bool {
+    static HASH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let hash = HASH.get_or_init(|| std::env::var("VICTORY_SNAP").ok());
+    hash.as_ref().is_some_and(|h| h.split(',').any(|h| name.contains(h)))
+        && dump_on()
+        && listed(crate::queue::presented() + 1)
+}
+
+/// Notes a texture a bind names, with the state it needs.
+pub(crate) fn snap_note(resource: usize, state: u32) {
+    SNAPPED.with(|s| {
+        if let Some(list) = s.borrow_mut().as_mut() {
+            list.push((resource, state));
+        }
+    });
+}
+
+/// Records copies of the noted textures, and their return to their states.
+pub(crate) fn snap(list: &crate::host::HostList, when: &str, label: &str) {
+    let noted = SNAPPED.with(|s| s.borrow().clone().unwrap_or_default());
+    let Some(host) = crate::host::host() else { return };
+    for (resource, state) in noted {
+        let this = resource as crate::object::This;
+        let Some(texture) = crate::resource::host_resource(this) else { continue };
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        // `VICTORY_SNAP_FORMATS`: only textures of these formats.
+        static ONLY: std::sync::OnceLock<Option<Vec<i32>>> = std::sync::OnceLock::new();
+        let only = ONLY.get_or_init(|| {
+            let list = std::env::var("VICTORY_SNAP_FORMATS").ok()?;
+            Some(list.split(',').filter_map(|f| f.trim().parse().ok()).collect())
+        });
+        if only.as_ref().is_some_and(|o| !o.contains(&d.Format.0)) {
+            continue;
+        }
+        crate::list::ensure_state(list, this, 0x800);
+        if let Some((buffer, footprint)) = read_back(&host.device, &list.list, texture) {
+            let name = format!("{when} {label} {resource:#x} {}x{} f{} (state {state:#x})", d.Width, d.Height, d.Format.0);
+            // A mark that stays if the copy has not run when it is read.
+            // SAFETY: a read-back buffer of ours, nothing runs on it yet.
+            unsafe {
+                let mut data = std::ptr::null_mut();
+                if buffer.Map(0, None, Some(&mut data)).is_ok() {
+                    std::ptr::write_bytes(data.cast::<u8>(), 0xee, buffer.GetDesc().Width as usize);
+                    buffer.Unmap(0, None);
+                }
+            }
+            let frame = crate::queue::presented() + 1;
+            SNAPS.lock().unwrap_or_else(|e| e.into_inner()).push((frame, name, buffer, footprint));
+        }
+        crate::list::ensure_state(list, this, state);
+    }
+}
+
+pub(crate) fn log_snaps(now: u64) {
+    log_words(now);
+    let due: Vec<_> = {
+        let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
+        snaps.extract_if(.., |s| s.0 + 3 <= now).collect()
+    };
+    for (frame, name, buffer, footprint) in due {
+        let f = footprint.Footprint;
+        let texel = match f.Format.0 {
+            39..=47 => 4,
+            55..=59 | 53 | 54 => 2,
+            60..=65 => 1,
+            _ => 4,
+        };
+        // Two dwords a texel: the second one is told (a depth, beside an index).
+        let (step, skip) = if matches!(f.Format.0, 9..=22) { (8, 4) } else { (texel, 0) };
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the copy finished; the mapping spans the footprint's rows.
+        unsafe {
+            if buffer.Map(0, None, Some(&mut data)).is_err() {
+                continue;
+            }
+            let pitch = f.RowPitch as usize;
+            let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+            let mut values = std::collections::HashMap::<u32, u32>::new();
+            for y in 0..f.Height as usize {
+                for x in 0..f.Width as usize {
+                    let mut word = [0u8; 4];
+                    word[..texel].copy_from_slice(&rows[y * pitch + x * step + skip..][..texel]);
+                    *values.entry(u32::from_le_bytes(word)).or_default() += 1;
+                }
+            }
+            // The whole picture too, as it is (`VICTORY_SNAP_RAW`).
+            if let Some(dir) = folder()
+                && std::env::var_os("VICTORY_SNAP_RAW").is_some()
+            {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let plain: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(90).collect();
+                let mut bytes = Vec::new();
+                for y in 0..f.Height as usize {
+                    bytes.extend_from_slice(&rows[y * pitch..][..f.Width as usize * step]);
+                }
+                let _ = std::fs::write(dir.join(format!("snap-{frame}-{n:03}-{plain}-{}x{}x{step}.raw", f.Width, f.Height)), bytes);
+            }
+            let kinds = values.len();
+            let mut most: Vec<(u32, u32)> = values.into_iter().collect();
+            most.sort_by_key(|e| std::cmp::Reverse(e.1));
+            most.truncate(6);
+            tracing::info!(frame, name, kinds, most = format_args!("{most:x?}"), "snap");
+            buffer.Unmap(0, None);
+        }
+    }
+}
+
+/// With the snaps: bytes of a buffer, as dwords.
+static SNAP_WORDS: std::sync::Mutex<Vec<(u64, String, ID3D12Resource)>> = std::sync::Mutex::new(Vec::new());
+
+/// Records a copy of `len` bytes of `buffer` (arguments an indirect dispatch
+/// ran with), logged with the snaps.
+pub(crate) fn snap_words(list: &crate::host::HostList, buffer: &ID3D12Resource, offset: u64, len: u64, label: String) {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let Some(host) = crate::host::host() else { return };
+    let mut made: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation, and a copy on an open list into a buffer kept
+    // until it is read.
+    unsafe {
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: len,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        if host
+            .device
+            .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut made)
+            .is_err()
+        {
+            return;
+        }
+        let Some(to) = made else { return };
+        // (what the dispatch before wrote, not what was there before it)
+        let turn = |before, after| D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: std::mem::transmute_copy(buffer),
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: before,
+                    StateAfter: after,
+                }),
+            },
+        };
+        let (uav, source) = (D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list.list.ResourceBarrier(&[turn(uav, source)]);
+        list.list.CopyBufferRegion(&to, 0, buffer, offset, len);
+        list.list.ResourceBarrier(&[turn(source, uav)]);
+        SNAP_WORDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((crate::queue::presented() + 1, label, to));
+    }
+}
+
+/// The small title buffers a dispatch's text names (`buffer Some((address,
+/// length))`), as they are after it.
+pub(crate) fn snap_buffers(list: &crate::host::HostList, text: &str, name: &str) {
+    for part in text.split("buffer Some((").skip(1) {
+        let mut numbers = part.split([',', ')']).map(|n| n.trim().parse::<u64>());
+        let (Some(Ok(address)), Some(Ok(len))) = (numbers.next(), numbers.next()) else { continue };
+        if len > 1 << 18 {
+            continue;
+        }
+        if let Some(copy) = crate::shadow::find(address, len) {
+            snap_words(list, &copy.buffer, copy.offset(address), len & !3, format!("{name} tampon {address:#x} {len}"));
+        }
+    }
+}
+
+fn log_words(now: u64) {
+    let due: Vec<_> = {
+        let mut words = SNAP_WORDS.lock().unwrap_or_else(|e| e.into_inner());
+        words.extract_if(.., |s| s.0 + 3 <= now).collect()
+    };
+    for (frame, label, buffer) in due {
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the copy finished; the mapping spans the buffer.
+        unsafe {
+            if buffer.Map(0, None, Some(&mut data)).is_ok() {
+                let n = (buffer.GetDesc().Width / 4) as usize;
+                let words = std::slice::from_raw_parts(data.cast::<u32>(), n).to_vec();
+                if let (true, Some(dir)) = (n > 64, folder()) {
+                    let plain: String = label.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+                    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    let _ = std::fs::write(dir.join(format!("snap-{frame}-buf-{plain}.raw")), bytes);
+                } else {
+                    tracing::info!(frame, label, ?words, "snap: arguments");
+                }
+                buffer.Unmap(0, None);
+            }
+        }
+    }
+}
+
+/// Records of indirect rectangle draws of a listed frame: address, pipeline.
+static RECTS: std::sync::Mutex<Vec<(u64, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Notes an indirect rectangle draw's record.
+pub(crate) fn note_rects(at: u64, name: &str) {
+    if dump_on() && listed(crate::queue::presented() + 1) {
+        RECTS.lock().unwrap_or_else(|e| e.into_inner()).push((at, name.to_owned()));
+    }
+}
+
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
@@ -360,6 +605,14 @@ pub(crate) fn note_target(resource: crate::object::This) {
 
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
+    // The records of the indirect rectangle draws, as title memory holds
+    // them now (written back once their submission ran).
+    for (at, name) in RECTS.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+        let mut bytes = [0u8; 16];
+        let read = crate::host::read_into(at as *const u8, &mut bytes);
+        let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
+        tracing::info!(frame, at = format_args!("{at:#x}"), read, ?words, name, "indirect rectangles");
+    }
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
@@ -445,6 +698,108 @@ fn dump_one(
                 (v.len(), v.into_iter().take(12).collect::<Vec<_>>())
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
+        }
+        // A float target of a few texels: its values.
+        if f.Width * f.Height <= 16 && matches!(f.Format.0, 2 | 10 | 16 | 26 | 34 | 41 | 54) {
+            let mut text = String::new();
+            for y in 0..f.Height as usize {
+                for x in 0..f.Width as usize {
+                    let at = |n: usize| &rows[y * pitch + x * n..][..n];
+                    let floats = |p: &[u8]| p.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect::<Vec<_>>();
+                    let halves = |p: &[u8]| p.as_chunks::<2>().0.iter().map(|c| half(u16::from_le_bytes(*c))).collect::<Vec<_>>();
+                    let v = match f.Format.0 {
+                        2 => floats(at(16)),
+                        16 => floats(at(8)),
+                        41 => floats(at(4)),
+                        10 => halves(at(8)),
+                        34 => halves(at(4)),
+                        54 => halves(at(2)),
+                        _ => {
+                            let w = u32::from_le_bytes(at(4).try_into().unwrap_or([0; 4]));
+                            vec![small_float(w & 0x7ff, 6), small_float(w >> 11 & 0x7ff, 6), small_float(w >> 22, 5)]
+                        }
+                    };
+                    text.push_str(&format!("{v:.4?} "));
+                }
+            }
+            tracing::info!(frame, i, ?resource, width = d.Width, height = d.Height, format = d.Format.0, text, "small float target");
+        }
+        // A float target: values no picture should hold.
+        if let Some((bytes, channels)) = match f.Format.0 {
+            10 => Some((8, 3)),
+            26 => Some((4, 3)),
+            34 => Some((4, 2)),
+            41 => Some((4, 1)),
+            54 => Some((2, 1)),
+            2 => Some((16, 3)),
+            _ => None,
+        } {
+            let (mut nan, mut inf, mut huge, mut negative, mut max) = (0u32, 0u32, 0u32, 0u32, 0f32);
+            let mut boxed = [u32::MAX, u32::MAX, 0, 0];
+            for y in 0..f.Height as usize {
+                for x in 0..f.Width as usize {
+                    let p = &rows[y * pitch + x * bytes..][..bytes];
+                    let half_at = |i: usize| half(u16::from_le_bytes([p[2 * i], p[2 * i + 1]]));
+                    let word = |i: usize| u32::from_le_bytes(p[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
+                    let mut bad = false;
+                    for c in 0..channels {
+                        let v = match f.Format.0 {
+                            10 | 34 | 54 => half_at(c),
+                            26 => {
+                                let w = word(0);
+                                match c {
+                                    0 => small_float(w & 0x7ff, 6),
+                                    1 => small_float(w >> 11 & 0x7ff, 6),
+                                    _ => small_float(w >> 22, 5),
+                                }
+                            }
+                            _ => f32::from_bits(word(c)),
+                        };
+                        if v.is_nan() {
+                            nan += 1;
+                            bad = true;
+                        } else if v.is_infinite() {
+                            inf += 1;
+                            bad = true;
+                        } else {
+                            max = max.max(v);
+                            negative += u32::from(v < -0.001);
+                            if v > 5000.0 {
+                                huge += 1;
+                                bad = true;
+                            }
+                        }
+                    }
+                    if bad {
+                        boxed = [boxed[0].min(x as u32), boxed[1].min(y as u32), boxed[2].max(x as u32), boxed[3].max(y as u32)];
+                    }
+                }
+            }
+            if nan + inf + huge > 0 {
+                tracing::info!(frame, i, ?resource, width = d.Width, height = d.Height, format = d.Format.0, nan, inf, huge, negative, max, ?boxed, "odd values");
+            }
+        }
+        // A small integer target: which values it holds, the most common first.
+        let texel = match d.Format.0 {
+            39..=43 => 4,
+            55..=59 => 2,
+            60..=65 => 1,
+            _ => 0,
+        };
+        if texel != 0 && f.Width * f.Height <= 15_000 {
+            let mut values = std::collections::HashMap::<u32, u32>::new();
+            for y in 0..f.Height as usize {
+                for x in 0..f.Width as usize {
+                    let mut word = [0u8; 4];
+                    word[..texel].copy_from_slice(&rows[y * pitch + x * texel..][..texel]);
+                    *values.entry(u32::from_le_bytes(word)).or_default() += 1;
+                }
+            }
+            let kinds = values.len();
+            let mut most: Vec<(u32, u32)> = values.into_iter().collect();
+            most.sort_by_key(|e| std::cmp::Reverse(e.1));
+            most.truncate(10);
+            tracing::info!(frame, i, ?resource, width = d.Width, height = d.Height, format = d.Format.0, kinds, most = format_args!("{most:x?}"), "small integer target");
         }
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(
@@ -805,6 +1160,18 @@ pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
             .flat_map(|pixel| pixel[..3].iter().copied())
             .max()
             .unwrap_or(0);
+        let pixels = bytes.chunks(SLOT as usize);
+        let count = pixels.len();
+        let bright = pixels.filter(|p| p[..3].iter().all(|&c| c > 190)).count();
+        static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if bright * 2 > count && WORLD.load(std::sync::atomic::Ordering::Relaxed) != u64::MAX {
+            let frame = crate::queue::presented();
+            tracing::info!(frame, bright, count, "a white frame");
+            let listed = WHITE.load(std::sync::atomic::Ordering::Relaxed);
+            if (listed == u64::MAX || frame > listed + 6) && SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                WHITE.store(frame + 2, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         buffer.Unmap(0, None);
         let mut levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
         if levels.len() == 12 {

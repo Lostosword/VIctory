@@ -113,6 +113,11 @@ fn limit(typed: &str, max: u32) -> String {
 /// Asks the user in a modal host dialog; `None` if dismissed.
 #[cfg(not(test))]
 fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
+    if victory_gpu::background() {
+        // A topmost dialog would take the focus; nobody is there to type.
+        tracing::info!(title, "text entry dismissed (background run)");
+        return None;
+    }
     dialog::ask(title, description, default, max)
 }
 

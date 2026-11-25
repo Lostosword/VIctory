@@ -285,6 +285,25 @@ pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 
     host::terminate_process(process, code)
 }
 
+/// A title that suspends a thread. Under Wine the thread may stand inside the
+/// runtime, Wine's unix side or the host's Direct3D with a lock of theirs: the
+/// title's stall watchdog suspended our pipeline workers there, and everything
+/// that wants Wine's memory lock waited for ever. So the call is answered as
+/// done and the thread runs on (what the title does with it, a stack for a
+/// report, needs no stillness). `VICTORY_TITLE_SUSPEND=1` lets the host do it.
+#[cfg(windows)]
+pub extern "system" fn SuspendThread(thread: *mut c_void) -> u32 {
+    static REAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ASKED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let real = *REAL.get_or_init(|| std::env::var("VICTORY_TITLE_SUSPEND").as_deref() == Ok("1"));
+    let n = ASKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 24 || n.is_power_of_two() {
+        let (id, name) = host::thread_of(thread);
+        tracing::warn!(n, id, name, real, "title suspends a thread");
+    }
+    if real { host::suspend_thread(thread) } else { 0 }
+}
+
 /// The pseudo handle of one of our modules: its address, never a real image.
 fn handle(m: &HleModule) -> *mut c_void {
     m as *const HleModule as *mut c_void
@@ -348,6 +367,13 @@ fn refuse(file: &str) {
     }
 }
 
+/// An export of a mapped title DLL, as the DLL has it (ours passed over).
+#[cfg(windows)]
+pub(crate) fn own_export(base: usize, name: &std::ffi::CStr) -> Option<usize> {
+    let at = host::get_proc_address(base as *mut c_void, name.as_ptr().cast());
+    (!at.is_null()).then_some(at as usize)
+}
+
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 
 pub(crate) fn module() -> HleModule {
@@ -382,6 +408,8 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            #[cfg(windows)]
+            hle_export!(SuspendThread),
         ],
     }
 }
@@ -484,6 +512,30 @@ mod host {
     pub(super) fn terminate_process(process: *mut c_void, code: u32) -> i32 {
         // SAFETY: see above.
         unsafe { TerminateProcess(process, code) }
+    }
+
+    pub(super) fn suspend_thread(thread: *mut c_void) -> u32 {
+        // SAFETY: the title's own handle, forwarded.
+        unsafe { windows_sys::Win32::System::Threading::SuspendThread(thread) }
+    }
+
+    /// The id and description of the thread behind a handle.
+    pub(super) fn thread_of(thread: *mut c_void) -> (u32, String) {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::System::Threading::{GetThreadDescription, GetThreadId};
+        // SAFETY: queries on the title's handle; the system allocates the
+        // description, freed with LocalFree.
+        unsafe {
+            let id = GetThreadId(thread);
+            let mut name = std::ptr::null_mut();
+            if GetThreadDescription(thread, &mut name) < 0 || name.is_null() {
+                return (id, String::new());
+            }
+            let len = (0..).take_while(|&i| *name.add(i) != 0).count();
+            let text = String::from_utf16_lossy(std::slice::from_raw_parts(name, len));
+            LocalFree(name.cast());
+            (id, text)
+        }
     }
 
     pub(super) fn set_unhandled_exception_filter(filter: extern "system" fn(*const c_void) -> i32) {

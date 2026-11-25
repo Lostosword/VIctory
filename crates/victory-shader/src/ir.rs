@@ -149,7 +149,12 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
     }
     leaders.sort_unstable();
     leaders.dedup();
-    let parked = unspill(&mut list, &leaders, wave64, lanes, vgprs);
+    // First with each life of a lane on its own; if that takes more scalar
+    // codes than there are, lane by lane.
+    let mut parked = unspill(&mut list, &leaders, Some(&flows), wave64, lanes, vgprs);
+    if parked.is_empty() {
+        parked = unspill(&mut list, &leaders, None, wave64, lanes, vgprs);
+    }
     let block_at = |offset: usize| {
         leaders
             .binary_search(&offset)
@@ -226,6 +231,153 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
     Ok(rename(blocks, wave64, vgprs))
 }
 
+/// `v_writelane_b32 vN, sX, K` / `v_readlane_b32 sX, vN, K`: (save, N, X, K).
+type Park = Option<(bool, u8, u8, u32)>;
+
+/// Renumbers the lanes of `parks` so that each life of a lane (the saves a
+/// restore may see, and the restores that see them) has a number of its own,
+/// 64 apart from the machine's: a lane the compiler took again for another
+/// value is another lane. The two halves of a register pair whose lives run
+/// side by side keep neighbouring numbers. `None` if a lane is restored where
+/// nothing (or a path without a save) reaches it, or control leaves in a way
+/// not followed here: the lanes are then left as they are.
+fn lives(
+    list: &[gfx10::Instruction],
+    leaders: &[usize],
+    flows: &[Flow],
+    written: &[Vec<u8>],
+    read: &[Vec<u8>],
+    parks: &mut [Park],
+) -> Option<()> {
+    let at = |offset: usize| leaders.binary_search(&offset).ok();
+    let n = leaders.len();
+    let first: Vec<usize> = leaders.iter().map(|&l| list.partition_point(|i| i.offset < l)).collect();
+    let end = |b: usize| first.get(b + 1).copied().unwrap_or(list.len());
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for b in 0..n {
+        let last = end(b).checked_sub(1)?;
+        match flows[last] {
+            Flow::Next => preds.get_mut(b + 1)?.push(b),
+            Flow::Jump(t) => preds[at(t)?].push(b),
+            Flow::Branch(t) => {
+                preds[at(t)?].push(b);
+                preds.get_mut(b + 1)?.push(b);
+            }
+            Flow::Stop if list[last].name() == Some("s_setpc_b64") => return None,
+            Flow::Stop => {}
+        }
+    }
+    let mut slots: Vec<(u8, u32)> = parks.iter().flatten().map(|p| (p.1, p.3)).collect();
+    slots.sort_unstable();
+    slots.dedup();
+    // Union-find over the instructions that park or restore.
+    let mut up: Vec<usize> = (0..list.len()).collect();
+    fn top(up: &mut [usize], mut i: usize) -> usize {
+        while up[i] != i {
+            up[i] = up[up[i]];
+            i = up[i];
+        }
+        i
+    }
+    for &slot in &slots {
+        // Per block the saves of the slot that may reach its end (one life's
+        // worth each: they are joined as soon as one restore sees them).
+        let mut out: Vec<std::collections::BTreeSet<usize>> = vec![Default::default(); n];
+        let here = |i: usize| parks[i].filter(|p| (p.1, p.3) == slot);
+        loop {
+            let mut changed = false;
+            for b in 0..n {
+                let mut now: std::collections::BTreeSet<usize> =
+                    preds[b].iter().flat_map(|&q| out[q].iter().copied()).collect();
+                if let Some(i) = (first[b]..end(b)).rev().find(|&i| here(i).is_some_and(|p| p.0)) {
+                    now = [i].into();
+                }
+                if now != out[b] {
+                    out[b] = now;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for b in 0..n {
+            let mut now: std::collections::BTreeSet<usize> =
+                preds[b].iter().flat_map(|&q| out[q].iter().copied()).collect();
+            for i in first[b]..end(b) {
+                let Some(park) = here(i) else { continue };
+                if park.0 {
+                    now = [i].into();
+                    continue;
+                }
+                let mut seen = now.iter();
+                let &one = seen.next()?;
+                let one = top(&mut up, one);
+                for &other in seen {
+                    let other = top(&mut up, other);
+                    up[other] = one;
+                }
+                let me = top(&mut up, i);
+                up[me] = one;
+            }
+        }
+    }
+    let life: Vec<usize> = (0..list.len()).map(|i| top(&mut up, i)).collect();
+    // In the order their first members stand.
+    let mut found: Vec<usize> = Vec::new();
+    for i in (0..list.len()).filter(|&i| parks[i].is_some()) {
+        if !found.contains(&life[i]) {
+            found.push(life[i]);
+        }
+    }
+    // Each life its number, then the halves of a pair next to each other: a
+    // life whose every save and restore is followed by that of the next
+    // register in the next lane, all of one life there and all of it.
+    let of = |l: usize| -> Vec<usize> { (0..list.len()).filter(|&i| parks[i].is_some() && life[i] == l).collect() };
+    let leader = |i: usize| leaders.binary_search(&list[i].offset).is_ok();
+    let next_half = |i: usize| -> Option<usize> {
+        let (save, reg, code, lane) = parks[i]?;
+        let mut j = i + 1;
+        while j < list.len() && !leader(j) {
+            if parks[j] == Some((save, reg, code + 1, lane + 1)) {
+                return Some(j);
+            }
+            if written[j].contains(&code) || written[j].contains(&(code + 1)) || !save && read[j].contains(&(code + 1)) {
+                return None;
+            }
+            j += 1;
+        }
+        None
+    };
+    let mut number: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+    let mut next = 0u32;
+    for &l in &found {
+        if number.contains_key(&l) {
+            continue;
+        }
+        let members = of(l);
+        let halves: Option<Vec<usize>> = members.iter().map(|&i| next_half(i)).collect();
+        let upper = halves.as_ref().and_then(|h| {
+            let u = life[*h.first()?];
+            let whole = of(u);
+            let mut mine = h.clone();
+            mine.sort_unstable();
+            (mine == whole && !number.contains_key(&u)).then_some(u)
+        });
+        next += 1;
+        number.insert(l, next);
+        if let Some(u) = upper {
+            number.insert(u, next);
+        }
+    }
+    for (i, park) in parks.iter_mut().enumerate() {
+        if let Some(p) = park {
+            p.3 += 64 * number[&life[i]];
+        }
+    }
+    Some(())
+}
+
 /// Scalar registers the compiler parked in lanes of a VGPR, as scalar moves.
 ///
 /// When it runs out of SGPRs the console compiler saves one in a lane of a
@@ -246,9 +398,14 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
 /// address) moves as a pair (`s_mov_b64`) when every save and every restore
 /// of the two lanes come together, so a parked lane mask comes back as the
 /// mask it is; otherwise its halves come back as two scalars.
+///
+/// With `flows`, a lane the compiler used again for something else counts as
+/// another lane ([`lives`]): a program that parks a mask in two lanes here
+/// and a number in one of them there keeps its masks whole.
 fn unspill(
     list: &mut [gfx10::Instruction],
     leaders: &[usize],
+    flows: Option<&[Flow]>,
     wave64: bool,
     lanes: u8,
     vgprs: u16,
@@ -333,6 +490,11 @@ fn unspill(
         return Vec::new();
     }
     let leader = |i: usize| leaders.binary_search(&list[i].offset).is_ok();
+    if let Some(flows) = flows
+        && lives(list, leaders, flows, &written, &read, &mut parks).is_none()
+    {
+        return Vec::new();
+    }
     // Lane pairs (register, lower lane) that always move together: each
     // save of the lower lane is followed, in the same block and before its
     // register changes, by the save of the next register into the next
@@ -601,6 +763,41 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
             continue;
         };
         if ends(taken) && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
+            block.insts.pop();
+            block.exit = Exit::Jump(not_taken);
+            any = true;
+        }
+    }
+    if !any {
+        return None;
+    }
+    for block in &mut blocks {
+        block.phis.clear();
+    }
+    link(&mut blocks);
+    split_irreducible(&mut blocks).ok()?;
+    Some(rename(blocks, p.wave64, p.vgprs))
+}
+
+/// The program without the skips no lane that gets there can take: an
+/// `s_cbranch_execz` behind an `s_and_saveexec` with a mask every running
+/// lane is in (the compiler drops out of whole-quad mode around each store,
+/// `s_and_saveexec_b64 .., s[40:41]` with the mask the program started
+/// with). What the code after such a branch reads is what the region left,
+/// never what stood before it; with the lanes that would have left earlier
+/// kept ([`without_skips`]) it would be a mix of both. `lanes` is `p` as one
+/// lane runs it. `None` if there is none.
+pub(crate) fn without_dead_skips(p: &Program, lanes: &crate::structure::Structured) -> Option<Program> {
+    use crate::structure::LaneExit;
+    let mut blocks = p.blocks.clone();
+    let mut any = false;
+    for (b, block) in blocks.iter_mut().enumerate() {
+        let (Exit::Branch { not_taken, .. }, LaneExit::Branch { when, .. }) = (block.exit, lanes.exits[b]) else {
+            continue;
+        };
+        if block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz")
+            && !lanes.bools.meet(&[(lanes.reach[b], true), (when, true)])
+        {
             block.insts.pop();
             block.exit = Exit::Jump(not_taken);
             any = true;

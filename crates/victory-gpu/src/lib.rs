@@ -43,6 +43,8 @@ pub mod queue;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
+pub mod upscale;
+#[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
@@ -50,17 +52,33 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod tiles;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod mapped;
 
 #[cfg(windows)]
 pub use host::on_failure;
+
+/// `VICTORY_BACKGROUND=1`: a run nobody sits at (someone works in other
+/// programs meanwhile). Windows open without taking the focus, the real
+/// keyboard is not read (scripted keys still are), the text entry dialog
+/// is dismissed and the title's sound is muted.
+pub fn background() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BACKGROUND").is_ok_and(|v| v.trim() == "1"))
+}
+#[cfg(windows)]
+pub use mapped::{title_pages_mapped, title_pages_released, title_pages_reserved, title_pages_unmapped};
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
+    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
+    tracking as write_tracking, writing as kernel_will_write,
 };

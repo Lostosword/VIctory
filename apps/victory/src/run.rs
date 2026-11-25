@@ -107,8 +107,26 @@ pub fn run(
         return Ok(());
     }
     victory_loader::report_crashes();
+    // Grand Theft Auto VI's stall watchdog would end a slow start;
+    // `VICTORY_TITLE_WATCHDOG=1` leaves it alone. After the reporter, so
+    // ahead of it: what is stepped over is no crash.
+    if std::env::var("VICTORY_TITLE_WATCHDOG").as_deref() != Ok("1") {
+        use victory_game::watchdog::{AT, BEFORE, resume};
+        victory_loader::resume_null_writes(
+            |before, at, callers| {
+                let callers: Vec<[u8; AT]> = callers
+                    .iter()
+                    .filter_map(|c| <[u8; AT]>::try_from(*c).ok())
+                    .collect();
+                resume(before, at, &callers).map(|r| (r.rip, r.copy))
+            },
+            BEFORE,
+            AT,
+        );
+    }
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
+    victory_hle::modules::audio::mute::start();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
     let late = LateDlls {
@@ -187,8 +205,10 @@ fn watch(base: usize, size: usize) {
 
 /// DLLs the host or our runtime provide are never taken from the title.
 #[cfg(windows)]
+// The FidelityFX loader is the title's own DLL: `modules::ffx` stands before
+// two of its exports only.
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
-    !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
+    !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.name != "ffx" && m.serves(dll))
 }
 
 /// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,

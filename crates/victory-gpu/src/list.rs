@@ -153,6 +153,21 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     crate::copystat::recorded(started);
 }
 
+/// [`with_state`], for passes of ours recorded among the title's.
+#[cfg(windows)]
+pub(crate) fn with_host_list(
+    this: This,
+    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
+) {
+    with_state(this, f);
+}
+
+/// Whether `table` is a list's function table.
+#[cfg(windows)]
+pub(crate) fn is_table(table: usize) -> bool {
+    table == LIST_FUNCTIONS.0.as_ptr() as usize || table == NEWER_LIST_FUNCTIONS.0.as_ptr() as usize
+}
+
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
 /// keeps them: its state goes with its last part.
@@ -861,6 +876,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // Depth textures shaders also write: what they wrote, first.
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
+            // A destination made level by level gets its levels' memory
+            // ahead of this list (`crate::tiles`).
+            crate::texture::card_writes(list, dst, to, None);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
@@ -994,6 +1012,11 @@ extern "system" fn copy_texture_region(
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
         list.twin_use(dst.resource, false, true);
+        // A destination made level by level gets the level's memory ahead
+        // of this list (`crate::tiles`): the title's bake copies each level
+        // of its result into a block-compressed texture of that kind, and
+        // a copy into a level without memory is dropped.
+        crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
         ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
@@ -1147,6 +1170,8 @@ extern "system" fn resolve(
         // Depth textures shaders also write: what they wrote, first.
         list.twin_use(dst, false, true);
         list.twin_use(src, false, false);
+        // As for a copy (`crate::tiles`).
+        crate::texture::card_writes(list, dst, to, Some(dst_sub));
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
@@ -1392,11 +1417,49 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
     let _ = this;
 }
 
+/// What the console's pipeline syncs become (`VICTORY_SYNC`): 0 nothing, 1
+/// a wait for earlier shader writes, 2 that and one before every dispatch
+/// (an experiment: what needs a wait the title did not ask for).
+#[cfg(windows)]
+pub(crate) fn sync_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("VICTORY_SYNC").as_deref() {
+        Ok("0") => 0,
+        Ok("1") => 1,
+        Ok("2" | "all") => 2,
+        // A host that runs compute passes side by side unless told (Metal
+        // behind D3DMetal).
+        _ => u8::from(crate::host::host().is_some_and(|h| h.mesh_output_limit().is_some())),
+    })
+}
+
+/// Records a wait for every earlier shader write.
+#[cfg(windows)]
+pub(crate) fn wait_for_writes(list: &crate::host::HostList) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+    // SAFETY: the same layout; no resource named.
+    let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+    // SAFETY: an open list.
+    unsafe { list.list.ResourceBarrier(&[barrier]) };
+}
+
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
-/// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// bottom of the pipe `(flags, control, address, size)`. Submissions are
+/// waited for, but within a list a host may run passes side by side: the
+/// title orders its compute passes with these, so each is a wait for
+/// earlier shader writes ([`sync_level`]).
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    if sync_level() > 0
+        && let Some(list) = host_list(this)
+    {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+        wait_for_writes(list);
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -1432,17 +1495,6 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 /// the pipeline; depth order and shading rate hints): any arguments,
 /// nothing returned.
 extern "system" fn ignored_state(_: This) {}
-
-/// Depth bounds `(min, max)`.
-/// shortcut: not set on the host list (no host pipeline of ours enables
-/// the test, `pipeline::host`); the first values are logged, so a run
-/// shows whether the title uses the test at all.
-extern "system" fn depth_bounds(_: This, min: f32, max: f32) {
-    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-        tracing::info!(min, max, "the title sets depth bounds, which the host is not given");
-    }
-}
 
 /// The title's draw state (decision 0007, step 3), kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
@@ -1485,6 +1537,9 @@ mod state {
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
         with_state(this, |list, s| s.set_stencil_ref(list, reference));
+    }
+    pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+        with_state(this, |list, s| s.set_depth_bounds(list, min, max));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
@@ -1653,6 +1708,7 @@ mod state {
     pub(super) use super::ignored_state as index_buffer;
     pub(super) use super::ignored_state as scissors;
     pub(super) use super::ignored_state as stencil_ref;
+    pub(super) use super::ignored_state as depth_bounds;
     pub(super) use super::ignored_state as targets;
     pub(super) use super::ignored_state as topology;
     pub(super) use super::ignored_state as vertex_buffers;
@@ -2097,7 +2153,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (52, clear_rtv as *const ()),                 // 0x1a0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, depth_bounds as *const ()),              // 0x220 depth bounds
+    (68, state::depth_bounds as *const ()),       // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait_value as *const ()),                // 0x238, 32 bits

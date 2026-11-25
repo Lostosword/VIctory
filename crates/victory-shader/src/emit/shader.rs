@@ -26,6 +26,16 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// Where the [`SLOT_STRIDES`] buffer goes on, in dwords: two per heap slot,
+/// the low and then the high dword of the title address of the buffer view
+/// at that slot (0: none). For a program that takes a buffer view out of the
+/// heap at an index it computes and reads the address out of the descriptor
+/// to walk the memory behind it (the shadow-ray trace programs take their
+/// ray-tracing structure this way).
+pub const SLOT_ADDRESSES: u32 = SLOT_STRIDES_COUNT;
+/// Dwords of the whole [`SLOT_STRIDES`] buffer: the strides, then the
+/// addresses ([`SLOT_ADDRESSES`]).
+pub const SLOT_STRIDES_DWORDS: u32 = 3 * SLOT_STRIDES_COUNT;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -73,6 +83,7 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
@@ -112,16 +123,21 @@ pub(crate) struct Geometry {
     pub max_vertices: u32,
 }
 
-/// The null slot a host view heap keeps at its end when the title's heap did not fit in it
-/// (0: no limit). Shaders translated while it is set read that slot for any view index at or
-/// past it: a host that caps its heap (NVIDIA at 1 000 000 views; a retail game's heap is
-/// larger) hung its GPU on reads past the end (GPU-based validation: "descriptor heap index
-/// out of bounds"), which AMD's driver forgives.
+/// The null slot every host view heap keeps at its end (0: no limit). Shaders translated while
+/// it is set read that slot for any view index at or past it. A read past a heap's end is
+/// undefined: a host that caps its heap (NVIDIA at 1 000 000 views; a retail game's heap is
+/// larger) hung its GPU (GPU-based validation: "descriptor heap index out of bounds"), and AMD
+/// RDNA3 took a page fault and removed the device.
 static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view heap, kept null.
 pub fn set_view_heap_limit(null_slot: u32) {
     VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`VIEW_LIMIT`]: the null slot shaders translated now clamp view indices to (0: none).
+pub fn view_heap_limit() -> u32 {
+    VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) struct Shader {
@@ -178,7 +194,7 @@ impl Shader {
         let res_ret = m.named_struct("dx.types.ResRet.f32", vec![f32, f32, f32, f32, i32]);
         let main_ty = m.func_ty(void, vec![]);
         m.ptr(main_ty);
-        let main = m.function("main", main_ty, None, true);
+        let main = m.function(&super::entry_name(), main_ty, None, true);
         let entry = m.new_block();
         Shader {
             m,
@@ -734,7 +750,7 @@ impl Shader {
         let props =
             (!props.is_empty()).then(|| self.m.md_node(props.into_iter().map(Some).collect()));
         let main = self.m.md_value(self.main);
-        let name = self.m.md_str("main");
+        let name = self.m.md_str(&super::entry_name());
         let entry = self
             .m
             .md_node(vec![Some(main), Some(name), sigs, resources, props]);
@@ -772,6 +788,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::DOUBLES != 0 {
+            features |= 0x1;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }
@@ -819,7 +838,11 @@ impl Shader {
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
         });
-        let hash = [0u8; 20];
+        // The shader hash (flags, then the program's digest), as DXC fills it:
+        // a host may tell programs apart by it (zero for all of them, they
+        // would be one).
+        let mut hash = [0u8; 20];
+        hash[4..].copy_from_slice(&container::hash(&dxil));
         let psg1 = container::signature(&self.prims, false);
         let mut parts: Vec<(&[u8; 4], &[u8])> =
             vec![(b"SFI0", &sfi0), (b"ISG1", &isg1), (b"OSG1", &osg1)];

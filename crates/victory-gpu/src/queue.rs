@@ -585,13 +585,19 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// A present plane: frame token, the plane's resources, the part of them
+/// shown, then placement, colour space and flags (72 bytes a plane, as a
+/// title passing two lays them out).
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    source: *const [i32; 4],
+    _rest: [u64; 5],
 }
+
+const _: () = assert!(std::mem::size_of::<Plane>() == 72);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -750,10 +756,8 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
-///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// Shows the first resource of the first plane in our window, with the
+/// second plane's, if there is one, blended over it.
 extern "system" fn present(
     _: This,
     planes: u32,
@@ -810,8 +814,42 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());
+        crate::capture::log_snaps(frame);
         if crate::capture::listed(frame) {
             crate::capture::dump_targets(frame);
+        }
+    }
+    // Diagnostics (`VICTORY_PLANES_LOG`): what the title presents, raw.
+    #[cfg(windows)]
+    if frame.is_power_of_two() && std::env::var_os("VICTORY_PLANES_LOG").is_some() {
+        // SAFETY: the title passes `planes` plane descriptions; the first
+        // one's start is readable whatever its full size.
+        let first = unsafe { plane_parameters.as_ref() };
+        let listed = first.map_or(0, |p| if p.resources.is_null() { 0 } else { p.count.min(4) });
+        tracing::info!(frame, planes, resources = first.map_or(0, |p| p.count), "present");
+        for i in 0..listed as usize {
+            // SAFETY: the plane lists `count` resources.
+            let resource = unsafe { *first.unwrap().resources.add(i) };
+            // SAFETY: a live host resource.
+            let desc = crate::resource::host_resource(resource).map(|t| unsafe { t.GetDesc() });
+            tracing::info!(
+                i,
+                ?resource,
+                width = desc.map_or(0, |d| d.Width),
+                height = desc.map_or(0, |d| d.Height),
+                format = desc.map_or(-1, |d| d.Format.0),
+                "present: a resource of the first plane"
+            );
+        }
+        // The rest of the parameters, to see how far one plane goes.
+        if let Some(p) = first {
+            // SAFETY: at least the plane's known start (24 bytes); the title's
+            // array lives on its stack or heap, so a few more words are there.
+            let words = unsafe { std::slice::from_raw_parts(std::ptr::from_ref(p).cast::<u64>(), 24) };
+            tracing::info!(?words, "present: the first plane's words");
+            // SAFETY: pointers of the title's description, or null.
+            let (source, place) = unsafe { (p.source.as_ref(), (words[4] as *const [i32; 4]).as_ref()) };
+            tracing::info!(?source, ?place, "present: the first plane's rectangles");
         }
     }
     #[cfg(windows)]
@@ -822,14 +860,41 @@ extern "system" fn present(
         && !plane.resources.is_null()
         // SAFETY: the plane lists `count` resources.
         && let resource = unsafe { *plane.resources }
+        && let geometry = crate::draw::geometry_target()
+        && let resource = geometry.unwrap_or(resource)
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
+        // shortcut: a third plane and placement on the screen are left out.
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        const PIXEL_SHADER: u32 = 0x80;
+        let rect = |plane: &Plane| {
+            // SAFETY: the title's rectangle for the plane's resource, or null.
+            unsafe { plane.source.as_ref() }.copied()
+        };
+        let over = (planes > 1)
+            // SAFETY: the title passes `planes` plane descriptions.
+            .then(|| unsafe { &*plane_parameters.add(1) })
+            .filter(|p| p.count > 0 && !p.resources.is_null())
+            // SAFETY: the plane lists `count` resources.
+            .map(|p| (unsafe { *p.resources }, rect(p)))
+            .filter(|(over, _)| *over != resource)
+            .and_then(|(over, part)| Some((over, crate::resource::host_resource(over)?, part)));
+        let wanted = if over.is_some() { PIXEL_SHADER } else { COPY_SOURCE };
+        let enter = |r: This| crate::resource::host_transition(r, wanted).map_or(wanted, |(_, before)| before);
+        let state = enter(resource);
+        let above = over.map(|(over, texture, part)| (over, enter(over), texture, part));
+        let shown = host.present(
+            &crate::host::Shown { texture, state, rect: if above.is_some() && geometry.is_none() { rect(plane) } else { None } },
+            above
+                .map(|(_, state, texture, rect)| crate::host::Shown { texture, state, rect })
+                .as_ref(),
+            frame,
+        );
         crate::resource::host_transition(resource, state);
+        if let Some((over, state, ..)) = above {
+            crate::resource::host_transition(over, state);
+        }
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]

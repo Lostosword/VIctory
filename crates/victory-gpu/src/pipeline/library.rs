@@ -363,13 +363,16 @@ pub(crate) fn removal_note() -> String {
 /// (hundreds of thousands of pages), once after each burst of loads.
 /// `VICTORY_LIBRARY_TRIM=0`: the pages stay until Windows takes them.
 pub(crate) fn trim() {
-    const QUIET_MS: u64 = 10_000;
     static ON: OnceLock<bool> = OnceLock::new();
     let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
     if at == 0
         || TRIMMED.load(Ordering::Relaxed)
-        || crate::host::now_ms() < LOADED_AT.load(Ordering::Relaxed) + QUIET_MS
         || !*ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_TRIM").is_none_or(|v| v != "0"))
+    {
+        return;
+    }
+    let quiet_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    if crate::host::now_ms() < LOADED_AT.load(Ordering::Relaxed) + quiet_ms
         || TRIMMED.swap(true, Ordering::Relaxed)
     {
         return;
@@ -504,6 +507,45 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// Whether D3DMetal made `pso` as a "no-op" (its own word): the conversion or
+/// Metal refused a stage, yet creation reports success. Its object is then
+/// left half made: the vertex buffer count `SetRenderVertexBuffers` loops to
+/// is never written (0x28c of the object; two runs died reading past its slots
+/// with counts 6,819 and 56,194), and a submission that uses it may never end.
+/// Read from the object, as `SetPipelineState` does: the private object behind
+/// the interface (0x58), its kind (0x10: 0 graphics, 1 compute) and the flag
+/// (0x28). Offsets of D3DMetal 4.0 beta 3 (x86-64); only on a Mac, and
+/// `VICTORY_NO_OP_CHECK=0` leaves it out.
+fn no_op(pso: &ID3D12PipelineState) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        crate::host::wine_host().as_deref() == Some("Darwin")
+            && std::env::var("VICTORY_NO_OP_CHECK").as_deref() != Ok("0")
+    });
+    if !on {
+        return false;
+    }
+    // SAFETY: a live pipeline of D3DMetal's: it reads these same fields of it
+    // in `SetPipelineState` and where it logs the failure.
+    unsafe {
+        let private = *pso.as_raw().cast::<u8>().add(0x58).cast::<*const u8>();
+        if private.is_null() || *private.add(0x10).cast::<u32>() > 1 {
+            return false;
+        }
+        *private.add(0x28) != 0
+    }
+}
+
+/// `pso`, unless the host made it as one that does nothing ([`no_op`]).
+fn working(pso: ID3D12PipelineState) -> windows::core::Result<ID3D12PipelineState> {
+    if !no_op(&pso) {
+        return Ok(pso);
+    }
+    let label = LABEL.with(|l| l.borrow().clone());
+    tracing::warn!("host pipeline refused by Metal (D3DMetal made it a no-op): {label}");
+    Err(windows::core::Error::new(windows::Win32::Foundation::E_FAIL, "a D3DMetal no-op pipeline"))
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -514,7 +556,7 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        return create().and_then(working);
     };
     let began = std::time::Instant::now();
     let loaded = {
@@ -533,14 +575,14 @@ pub(crate) fn pipeline(
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
             });
-            return Ok(pso);
+            return working(pso);
         }
         Err(e) => e,
     };
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
-        create()?
+        working(create()?)?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {

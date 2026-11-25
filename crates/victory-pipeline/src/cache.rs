@@ -48,7 +48,8 @@ impl Cache {
     pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
         let key = CacheKey::new(converter, input);
         let path = self.path_for(&key);
-        if path.is_file() {
+        // Not `Path::is_file`: see `victory_core::files`.
+        if victory_core::files::is_file(&path) {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
             return Ok(path);
         }
@@ -56,7 +57,13 @@ impl Cache {
             .convert(input)
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
         let dir = path.parent().expect("hashed path has a parent");
-        std::fs::create_dir_all(dir)?;
+        // One level under the root, which exists: made directly, since
+        // `create_dir_all` asks about an existing folder as `is_file` does.
+        match std::fs::create_dir(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => std::fs::create_dir_all(dir)?,
+        }
         // Write-then-rename so readers never see partial output.
         let tmp = tempfile_in(dir);
         let mut file = std::fs::OpenOptions::new()

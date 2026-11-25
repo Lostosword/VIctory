@@ -130,12 +130,49 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    /// The host code with less between the stages
+    /// ([`victory_shader::emit::translate_slim`]), which binds what the
+    /// translation binds; `None` if it cannot be made.
+    pub(crate) fn slim(&self, unread: &[(String, u32)]) -> Option<Vec<u8>> {
+        let whole = &self.translated()?.host;
+        match victory_shader::emit::translate_slim(&self.container, unread) {
+            Ok(slim)
+                if (&slim.user_data, &slim.samplers, &slim.root_cbvs, &slim.root_srvs, &slim.root_uavs)
+                    == (&whole.user_data, &whole.samplers, &whole.root_cbvs, &whole.root_srvs, &whole.root_uavs) =>
+            {
+                Some(slim.dxil)
+            }
+            Ok(_) => {
+                tracing::warn!(shader = ?self, "with fewer outputs it binds something else");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(shader = ?self, error = %e, "not translated with fewer outputs");
+                None
+            }
+        }
+    }
+
+    /// The inputs it declares and does not read.
+    pub(crate) fn unread_inputs(&self) -> Vec<(String, u32)> {
+        victory_shader::emit::unread_inputs(&self.container)
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                // `VICTORY_ENTRY_NAMES`: entry functions bear the hash, the only
+                // name Metal's shader validation gives.
+                let named = std::env::var_os("VICTORY_ENTRY_NAMES").is_some();
+                if named {
+                    victory_shader::emit::name_entry(Some(format!("{}_{}", self.stage, self.hash)));
+                }
                 let done = translate(&self.container);
+                if named {
+                    victory_shader::emit::name_entry(None);
+                }
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -294,9 +331,16 @@ pub(crate) fn builder_runs() -> bool {
     if b.whole {
         return true;
     }
-    let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
+    let lacking: Vec<String> = b
+        .pipelines
+        .iter()
+        .filter(|p| !make::now(p))
+        .map(|p| make::missing(p).unwrap_or_default())
+        .collect();
+    let missing = lacking.len();
     if missing > 0 {
         b.off = true;
+        tracing::warn!("the ray-tracing structure builder lacks: {}", lacking.join(", "));
         tracing::warn!(
             missing,
             of = b.pipelines.len(),
@@ -406,7 +450,7 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -426,12 +470,17 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
-        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        let mut value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
+        // A file of them, one to a line or between commas.
+        if let Some(list) = std::env::var_os("VICTORY_SKIP_FILE").and_then(|f| std::fs::read_to_string(f).ok()) {
+            value.push(',');
+            value.push_str(&list.replace(['\n', '\r'], ","));
+        }
+        parse_skip_hashes(&value).into_iter().collect()
     });
     if hashes.is_empty() {
         return None;
@@ -442,7 +491,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }

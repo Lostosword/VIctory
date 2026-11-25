@@ -6,5 +6,6 @@
 //! hardware decompression.
 
 pub mod bcpack;
+pub mod fingerprint;
 pub mod texture;
 pub mod xma;

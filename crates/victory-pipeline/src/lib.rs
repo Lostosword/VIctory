@@ -21,3 +21,5 @@ pub trait Converter: Send + Sync {
     fn version(&self) -> u32;
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>>;
 }
+/// Whole-file reads for what the cache holds (see `victory_core::files`).
+pub use victory_core::files;

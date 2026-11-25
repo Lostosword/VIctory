@@ -161,6 +161,7 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                 std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
                 if let Some(pass) = clwb_loop(&bytes[..n]) {
                     // A whole write-back loop in one exception (see `clwb_loop`).
+                    retire_clwb(context.Rip as usize, &bytes[..n.min(5)]);
                     let limit = *gpr(context, pass.limit);
                     let base = gpr(context, pass.base);
                     *base = if *base <= limit {
@@ -177,6 +178,7 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                     && let Some(len) = clwb_len(bytes[..15].try_into().unwrap_or([0; 15]))
                 {
                     // A write-back hint: the PC's memory is coherent, so it has nothing to do.
+                    retire_clwb(context.Rip as usize, &bytes[..len]);
                     context.Rip += len as u64;
                     return true;
                 }
@@ -354,6 +356,145 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
         xmm[dst].Low = xmm[dst].Low & !(mask << at_bit) | value;
     }
     Some(len)
+}
+
+/// Turns the `clwb` at `at` (its first bytes `code`) into a no-operation of
+/// the same length, so it traps only this once: a title flushes every buffer
+/// it hands to the GPU, hundreds of thousands of times while it loads, and
+/// under a translator (Rosetta 2 below Wine on a Mac, which has no `clwb`)
+/// each trap costs an exception round trip of tens of microseconds.
+/// `0f ae /6` becomes `0f 1f /0` (`nop r/m`) with the same prefixes and
+/// operand bytes: two neighbouring bytes change, and other threads see the
+/// old instruction or the new one. `VICTORY_ISA_PATCH=0` leaves the code alone.
+///
+/// # Safety
+/// `at` is the address of a `clwb` in mapped code that just trapped.
+unsafe fn retire_clwb(at: usize, code: &[u8]) {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("VICTORY_ISA_PATCH").as_deref() != Ok("0")) {
+        return;
+    }
+    let Some(opcode) = code.windows(2).position(|w| w == [0x0f, 0xae]) else {
+        return;
+    };
+    let Some(&modrm) = code.get(opcode + 2) else {
+        return;
+    };
+    let target = (at + opcode + 1) as *mut [u8; 2];
+    let mut old = 0;
+    // SAFETY: two bytes of the instruction; the page's protection is put
+    // back, and the processor told its code changed.
+    unsafe {
+        if VirtualProtect(target.cast(), 2, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return;
+        }
+        target.write_unaligned([0x1f, modrm & 0xc7]);
+        VirtualProtect(target.cast(), 2, old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), target.cast(), 2);
+    }
+}
+
+/// How a faulting thread goes on: added to its instruction pointer, and a
+/// register to copy first (hardware numbers: destination, source).
+pub type Resume = (isize, Option<(u8, u8)>);
+/// Given the bytes before a faulting instruction, from it on, and at each
+/// code address near the top of the thread's stack (as many bytes as from
+/// the instruction on), decides whether and how the thread goes on.
+pub type NullWriteHook = fn(before: &[u8], at: &[u8], callers: &[&[u8]]) -> Option<Resume>;
+
+/// Stack slots looked at for code addresses.
+const STACK_SLOTS: usize = 32;
+
+static NULL_WRITE: std::sync::OnceLock<(NullWriteHook, usize, usize)> = std::sync::OnceLock::new();
+
+/// Lets `hook` decide about every write to address 0 (a title's deliberate
+/// crash it knows by its bytes): it gets `before` bytes ahead of the
+/// faulting instruction and `at` bytes from it on. Call after
+/// [`report_crashes`], so the hook is asked ahead of the reporter.
+pub fn resume_null_writes(hook: NullWriteHook, before: usize, at: usize) {
+    if NULL_WRITE.set((hook, before, at)).is_ok() {
+        // SAFETY: the handler only reads code and changes the faulting
+        // thread's registers.
+        unsafe { AddVectoredExceptionHandler(1, Some(on_null_write)) };
+    }
+}
+
+unsafe extern "system" fn on_null_write(info: *mut EXCEPTION_POINTERS) -> i32 {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_IMAGE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    // SAFETY: the system passes the exception being dispatched.
+    let (record, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
+    let Some(&(hook, before, at)) = NULL_WRITE.get() else {
+        return EXCEPTION_CONTINUE_SEARCH;
+    };
+    if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION
+        || record.NumberParameters < 2
+        || record.ExceptionInformation[0] != 1
+        || record.ExceptionInformation[1] != 0
+    {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let rip = context.Rip as usize;
+    // The code must be mapped image code on both sides of `rip`.
+    let image = |address: usize| {
+        // SAFETY: plain data filled in by the query.
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(address as *const _, &mut m, size_of_val(&m)) };
+        n != 0 && m.State == MEM_COMMIT && m.Type == MEM_IMAGE
+    };
+    if rip < before || !image(rip - before) || !image(rip + at) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // SAFETY: committed image memory, checked above.
+    let (b, a) = unsafe {
+        (
+            std::slice::from_raw_parts((rip - before) as *const u8, before),
+            std::slice::from_raw_parts(rip as *const u8, at),
+        )
+    };
+    // What the stack's top holds that points into image code: the thread's
+    // return addresses are among it.
+    let mut callers: [&[u8]; STACK_SLOTS] = [&[]; STACK_SLOTS];
+    let mut found = 0;
+    let (mut low, mut high) = (0, 0);
+    // SAFETY: writes the current thread's stack bounds.
+    unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+    let rsp = context.Rsp as usize;
+    for slot in (rsp..rsp + 8 * STACK_SLOTS).step_by(8) {
+        if slot < low || slot + 8 > high {
+            break;
+        }
+        // SAFETY: inside the faulting thread's stack, which is ours.
+        let target = unsafe { (slot as *const usize).read() };
+        if target > 0x1_0000 && image(target) && image(target + at) {
+            // SAFETY: committed image memory, checked just now.
+            callers[found] = unsafe { std::slice::from_raw_parts(target as *const u8, at) };
+            found += 1;
+        }
+    }
+    let Some((delta, copy)) = hook(b, a, &callers[..found]) else {
+        return EXCEPTION_CONTINUE_SEARCH;
+    };
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let n = SEEN.fetch_add(1, Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        eprintln!(
+            "VIctory: the title's deliberate crash at {} is skipped (#{n})",
+            locate(rip)
+        );
+    }
+    if let Some((to, from)) = copy {
+        let value = *gpr(context, from);
+        *gpr(context, to) = value;
+    }
+    context.Rip = context.Rip.wrapping_add_signed(delta as i64);
+    -1 // EXCEPTION_CONTINUE_EXECUTION
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {

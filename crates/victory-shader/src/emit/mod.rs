@@ -113,9 +113,9 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit,
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_ADDRESSES, SLOT_FAULTS, SLOT_MEMORY,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_STRIDES_DWORDS, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -188,6 +188,33 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
+/// Everything a translation depends on besides the container: the
+/// translator's own source (hashed at build time), the value of every
+/// `VICTORY_*` switch it reads, the host facts the device hands it (widest
+/// wave, view heap limit) and the settings above. The shader cache keys on
+/// this instead of on the whole executable, so a rebuild that leaves the
+/// translator alone keeps its translations. Call it after the device is made.
+pub fn translation_fingerprint() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
+    out.push(u8::from(cfg!(feature = "diagnostics")));
+    out.push(u8::from(cfg!(debug_assertions)));
+    for name in env!("VICTORY_SHADER_SWITCHES").split(',').filter(|n| !n.is_empty()) {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'=');
+        if let Some(value) = std::env::var_os(name) {
+            out.extend_from_slice(value.as_encoded_bytes());
+        }
+        out.push(0);
+    }
+    out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
+    out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
+    out.extend_from_slice(&loop_limit().to_le_bytes());
+    out.push(group_sync());
+    out.extend_from_slice(&shader_opt().to_le_bytes());
+    out
+}
+
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
 /// unreadable. Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {
@@ -198,6 +225,68 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
             None => v.parse().ok(),
         });
     parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
+}
+
+thread_local! {
+    /// What the next translation on this thread calls its entry function.
+    static ENTRY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Names the entry function of what this thread translates until the next
+/// call (`None`: `main`, as always): Metal's shader validation reports a
+/// fault by that name only. Part of the translation.
+pub fn name_entry(name: Option<String>) {
+    ENTRY.with(|e| *e.borrow_mut() = name);
+}
+
+std::thread_local! {
+    static SLIM: std::cell::RefCell<Option<Vec<(String, u32)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// [`translate`] with fewer values between a mesh and a pixel shader, for a
+/// pair whose outputs pass what the host takes: without clip distances
+/// (Apple's GPUs count them twice: for the clipper and as a value for the
+/// pixel shader) and without the elements `unread` names, which the pixel
+/// shader does not read ([`unread_inputs`]). A mesh vertex behind one of
+/// its clip planes takes its triangles with it instead. An error where the
+/// pixel shader reads the distances, or with cull distances.
+pub fn translate_slim(bytes: &[u8], unread: &[(String, u32)]) -> Result<HostShader, ShaderError> {
+    SLIM.with(|s| *s.borrow_mut() = Some(unread.to_vec()));
+    let done = translate(bytes);
+    SLIM.with(|s| *s.borrow_mut() = None);
+    done
+}
+
+/// The inputs a pixel shader declares and reads no channel of, by semantic
+/// name and index (system values left out).
+pub fn unread_inputs(container: &[u8]) -> Vec<(String, u32)> {
+    let Ok(c) = Container::parse(container) else { return Vec::new() };
+    let Some(part) = c.part(FourCC::ISG1) else { return Vec::new() };
+    let Ok(elements) = signature(part.data) else { return Vec::new() };
+    elements
+        .iter()
+        .enumerate()
+        // (a row of the part: 8 bytes of header, then 32 each; the channels
+        // read are at 25)
+        .filter(|(i, e)| e.kind == 0 && !e.half && part.data.get(8 + 32 * i + 25) == Some(&0))
+        .map(|(_, e)| (e.name.clone(), e.index))
+        .collect()
+}
+
+pub(crate) fn unclipped() -> bool {
+    SLIM.with(|s| s.borrow().is_some())
+}
+
+fn is_dropped(e: &container::SigElement) -> bool {
+    SLIM.with(|s| {
+        s.borrow().as_ref().is_some_and(|drop| {
+            e.kind == 6 || e.kind == 0 && !e.half && drop.iter().any(|(n, i)| *n == e.name && *i == e.index)
+        })
+    })
+}
+
+pub(crate) fn entry_name() -> String {
+    ENTRY.with(|e| e.borrow().clone()).unwrap_or_else(|| "main".into())
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -270,7 +359,23 @@ pub struct UserData {
 
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
+///
+/// A program refused because the first half of an interpolation is read as
+/// data is translated once more with first halves evaluated as the pair
+/// they start (`lower::with_first_half_pairs`), and only such a program:
+/// with that on for every program, 8,551 pixel programs of the title that
+/// already translated came out changed (an extra evaluation in each), for
+/// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    match translate_plain(container) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
+            lower::with_first_half_pairs(|| translate_plain(container))
+        }
+        other => other,
+    }
+}
+
+fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -355,15 +460,26 @@ pub fn emit(
         // without any branch that only skips code no lane is left for.
         let form = |p: Option<ir::Program>| {
             p.and_then(|p| {
-                let st = structure::structure(&p).ok()?;
-                let io = io::raise(&p, native).ok()?;
-                let res = resource::track(&p, &native.layout, native.stage, Some(&st)).ok()?;
+                let failed = |what: &str, e: ShaderError| {
+                    if why {
+                        eprintln!("WAVE64-FORM {what}: {e}");
+                    }
+                };
+                let st = structure::structure(&p).map_err(|e| failed("structure", e)).ok()?;
+                let io = io::raise(&p, native).map_err(|e| failed("io", e)).ok()?;
+                let res = resource::track(&p, &native.layout, native.stage, Some(&st))
+                    .map_err(|e| failed("resources", e))
+                    .ok()?;
                 Some((p, st, io, res))
             })
         };
+        // Skips no lane can take go first where they stand in the way of the
+        // forms below (the descriptors a region behind one makes).
+        let plain = ir::without_dead_skips(p, st);
+        let plain = plain.as_ref().unwrap_or(p);
         let forms = [
-            ("without early-outs", form(ir::without_early_outs(p))),
-            ("without skips", form(ir::without_skips(p, false))),
+            ("without early-outs", form(ir::without_early_outs(plain))),
+            ("without skips", form(ir::without_skips(plain, false))),
         ];
         for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
@@ -379,7 +495,20 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // On for the programs known to need one wide branch and to run so on
+        // an Apple GPU, by a fingerprint (FNV-1a) of their code: the screen
+        // tile classifier and the light binning pass, which go without a host
+        // pipeline otherwise. (`=0` turns these off too.)
+        let wide_on = match std::env::var("VICTORY_WAVE_WIDE").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => {
+                let code = native.code.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+                    (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+                });
+                [0x538a_1add_8a77_b591, 0xab7f_5616_e2ee_8cca].contains(&code)
+            }
+        };
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -390,7 +519,7 @@ pub fn emit(
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
-                let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+                let deep = if deep_on { form(ir::without_skips(plain, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
@@ -625,6 +754,19 @@ fn emit_program(
         }
         _ => 0,
     };
+    if unclipped() && matches!(native.stage, HwStage::Ms | HwStage::Ps) {
+        if inputs.iter().chain(&outputs).any(|e| e.kind == 7) {
+            return Err(ShaderError::Unsupported { offset: 0, what: "cull distances without clip distances" });
+        }
+        // (a pixel shader's outputs are its targets)
+        inputs.retain(|e| !is_dropped(e));
+        if native.stage == HwStage::Ms {
+            outputs.retain(|e| !is_dropped(e));
+        }
+    }
+    if let crate::native::StageIo::Ms(ms) = &native.io {
+        sort_mesh_outputs(&mut outputs, &prims, ms.max_vertices.min(128), ms.max_primitives.min(128));
+    }
     let l = lower::lower(&lower::Parts {
         native,
         p,
@@ -660,6 +802,36 @@ fn emit_program(
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
+}
+
+/// Apple's GPUs take 32 KiB of mesh outputs and count each vertex output at
+/// the next multiple of its own size, in signature order. Outputs that pass
+/// it that way go largest first (system values before them, where they
+/// were): nothing is left between them. Stages link by semantic and
+/// register, which stay.
+fn sort_mesh_outputs(
+    outputs: &mut [container::SigElement],
+    prims: &[container::SigElement],
+    vertices: u32,
+    primitives: u32,
+) {
+    let placed = |sizes: &mut dyn Iterator<Item = u32>| {
+        sizes
+            .filter(|&size| size > 0)
+            .fold(0u32, |end, size| end.next_multiple_of(size) + size)
+    };
+    let bytes = |outputs: &[container::SigElement]| {
+        let vertex = placed(
+            &mut std::iter::once(16)
+                .chain(outputs.iter().filter(|e| e.kind != 3).map(|e| 4 * u32::from(e.cols))),
+        );
+        let primitive = placed(&mut prims.iter().map(|e| 4 * u32::from(e.cols)));
+        vertices * vertex + primitives * primitive
+    };
+    // (From 24 KiB on: clip distances are placed apart, which this leaves out.)
+    if bytes(outputs) > 24 << 10 {
+        outputs.sort_by_key(|e| if e.kind == 0 { 8 - e.cols } else { 0 });
+    }
 }
 
 /// The rows of an `ISG1`/`OSG1` part.

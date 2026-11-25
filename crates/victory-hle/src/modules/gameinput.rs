@@ -58,7 +58,7 @@ const KEYBOARD: usize = PADS + 1;
 const DEVICES: usize = PADS + 2;
 
 /// Readings kept per device for next/previous lookups.
-const HISTORY: usize = 32;
+const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
@@ -1130,10 +1130,65 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        bridge: Bridge,
+    }
+
+    /// A pad another process publishes (`tools/macos/pad-bridge.swift`):
+    /// this Wine has no SDL, so its XInput misses Bluetooth pads. The file
+    /// named by `VICTORY_PAD_FILE` holds a counter that grows while the
+    /// publisher lives, whether a pad is connected, and an XInput state.
+    #[derive(Default)]
+    struct Bridge {
+        file: Option<std::fs::File>,
+        asked: bool,
+        counter: u32,
+        grew: Option<Instant>,
+    }
+
+    impl Bridge {
+        fn pad(&mut self) -> Option<PadState> {
+            use std::os::windows::fs::FileExt;
+            if !self.asked {
+                self.asked = true;
+                if let Some(path) = std::env::var_os("VICTORY_PAD_FILE") {
+                    self.file = std::fs::File::open(&path)
+                        .inspect_err(|e| tracing::warn!(%e, "VICTORY_PAD_FILE"))
+                        .ok();
+                }
+            }
+            let mut raw = [0u8; 20];
+            if self.file.as_ref()?.seek_read(&mut raw, 0).ok()? != raw.len() {
+                return None;
+            }
+            let word = |at: usize| u16::from_le_bytes([raw[at], raw[at + 1]]);
+            let long = |at: usize| u32::from(word(at)) | u32::from(word(at + 2)) << 16;
+            if long(0) != self.counter {
+                self.counter = long(0);
+                self.grew = Some(Instant::now());
+            }
+            let alive = self.grew.is_some_and(|at| at.elapsed() < Duration::from_secs(1));
+            if !alive || long(4) == 0 {
+                return None;
+            }
+            Some(convert(&XINPUT_GAMEPAD {
+                wButtons: word(8),
+                bLeftTrigger: raw[10],
+                bRightTrigger: raw[11],
+                sThumbLX: word(12) as i16,
+                sThumbLY: word(14) as i16,
+                sThumbRX: word(16) as i16,
+                sThumbRY: word(18) as i16,
+            }))
+        }
     }
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
+            if slot == 0
+                && let Some(state) = self.bridge.pad()
+            {
+                return Some(state);
+            }
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1166,7 +1221,10 @@ mod host {
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
-            if focused() {
+            // Not in a background run: under Wine a window shown without
+            // activation still counts as foreground, and key states are the
+            // whole machine's.
+            if !victory_gpu::background() && focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
@@ -1204,37 +1262,82 @@ mod host {
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
+        fn key(name: &str) -> Option<u8> {
+            Some(match name.trim() {
+                "Enter" => 0x0D,
+                "Esc" => 0x1B,
+                "Tab" => 0x09,
+                "Back" => 0x08,
+                "Up" => 0x26,
+                "Down" => 0x28,
+                "Left" => 0x25,
+                "Right" => 0x27,
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                    k.as_bytes()[0].to_ascii_uppercase()
+                }
+                _ => return None,
+            })
+        }
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
+                let (at, name) = entry.split_once(':')?;
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
+                    key(name)?,
                 ))
             });
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
-            .collect()
+            .collect();
+        down.extend(from_file(key));
+        down
+    }
+
+    /// Debugging aid: `VICTORY_KEYS_FILE=<file>` presses keys as a run goes
+    /// (by whoever watches it): the file holds `<number>:<key>`, and each
+    /// time the number is higher than the last one seen, the key is held
+    /// for 0.5 s (a title at a few frames a second still sees it). Read at
+    /// most every 50 ms.
+    #[cfg(feature = "diagnostics")]
+    fn from_file(key: fn(&str) -> Option<u8>) -> Option<u8> {
+        struct Watch {
+            read: Instant,
+            last: u64,
+            held: Option<(Instant, u8)>,
+        }
+        static FILE: LazyLock<Option<std::path::PathBuf>> =
+            LazyLock::new(|| std::env::var_os("VICTORY_KEYS_FILE").map(Into::into));
+        static WATCH: Mutex<Option<Watch>> = Mutex::new(None);
+        let file = FILE.as_ref()?;
+        let mut watch = WATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let w = watch.get_or_insert_with(|| Watch {
+            read: now,
+            last: 0,
+            held: None,
+        });
+        if now.duration_since(w.read) >= Duration::from_millis(50) {
+            w.read = now;
+            let text = std::fs::read_to_string(file).unwrap_or_default();
+            if let Some((number, name)) = text.trim().split_once(':')
+                && let (Ok(number), Some(vk)) = (number.trim().parse::<u64>(), key(name))
+                && number > w.last
+            {
+                w.last = number;
+                w.held = Some((now, vk));
+                tracing::info!(number, key = name.trim(), "key pressed from the keys file");
+            }
+        }
+        w.held
+            .filter(|&(since, _)| now.duration_since(since) < Duration::from_millis(500))
+            .map(|(_, vk)| vk)
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
