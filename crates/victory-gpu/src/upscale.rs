@@ -26,7 +26,7 @@ cbuffer Constants : register(b0) {
     float2 render; float2 size;
     float2 jitter; float2 motion_scale;
     float reset; float exposure_ratio; float far_is_one; float has_motion;
-    float2 history_size; float2 pad0;
+    float2 history_size; float most; float pad0;
     float4 pad1; float4 pad2;
 };
 Texture2D<float4> colour : register(t0);
@@ -111,7 +111,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         float3 old = to_ycc(squash(finite(then.rgb * exposure_ratio)));
         old = clamp(old, max(low, m1 - spread), min(high, m1 + spread));
         float moved = length(move * size);
-        float longest = lerp(16.0, 6.0, saturate(moved / 20.0));
+        float longest = min(lerp(16.0, 6.0, saturate(moved / 20.0)), most);
         count = clamp(then.a, 0.0, longest);
         float share = covered / (covered + count);
         blended = lerp(old, now, saturate(share));
@@ -119,6 +119,45 @@ void main(uint3 id : SV_DispatchThreadID) {
     float3 shown = finite(stretch(saturate(to_rgb(blended))));
     result[id.xy] = float4(shown, 1.0);
     kept[id.xy] = float4(shown, min(count + covered, 16.0));
+}
+"#;
+
+/// The light the title's ray tracing would have brought (it is off, and
+/// what neither the sun nor a lamp reaches was black): the colour of the
+/// surface under the light of the sky, less where its surroundings stand
+/// close. The picture with it, at the size the title rendered.
+const FILL: &str = r#"
+#define RS "RootConstants(num32BitConstants = 8, b0), DescriptorTable(SRV(t0, numDescriptors = 3), UAV(u0, numDescriptors = 1))"
+cbuffer Constants : register(b0) { float3 light; float far_is_one; uint2 size; uint frame; uint pad; };
+Texture2D<float4> colour : register(t0);
+Texture2D<float> depth : register(t1);
+Texture2D<float4> surface : register(t2);
+RWTexture2D<float4> result : register(u0);
+float nearness(int2 p) {
+    float z = depth.Load(int3(p, 0));
+    return far_is_one > 0.5 ? 1.0 - z : z;
+}
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= size)) return;
+    int2 p = int2(id.xy), last = int2(size) - 1;
+    float4 lit = colour.Load(int3(p, 0));
+    float z = nearness(p);
+    if (z > 0.0) {
+        float turn = 6.2831853 * frac(52.9829189 * frac(dot(float2(p) + 5.588238 * (frame & 7), float2(0.06711056, 0.00583715))));
+        float shut = 0.0;
+        for (int i = 0; i < 6; i++) {
+            float a = turn + i * 2.39996;
+            float2 off = float2(cos(a), sin(a)) * (2.5 + 4.5 * i);
+            // How much nearer than this point, as a share of the distance.
+            float nearer = 1.0 - z / max(nearness(clamp(p + int2(off), 0, last)), 1e-7);
+            shut += saturate(nearer * 40.0) * saturate(1.0 - nearer * 6.0);
+        }
+        float3 s = surface.Load(int3(p, 0)).rgb;
+        lit.rgb += s * s * light * (1.0 - 0.7 * saturate(shut / 4.0));
+    }
+    result[id.xy] = lit;
 }
 "#;
 
@@ -148,6 +187,8 @@ const WRITE: u32 = 0x8;
 struct Pass {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// [`FILL`]'s, if it was made.
+    fill: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
     views: ID3D12DescriptorHeap,
     cpu: usize,
     gpu: u64,
@@ -172,6 +213,74 @@ struct History {
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for History {}
 
+/// How many frames before it a frame is blended with, at most
+/// (`VICTORY_UPSCALE_HISTORY`, 16; 0: each is upscaled on its own). At ten
+/// frames a second things move far between two of them, and what the frames
+/// before held smears behind them; with none of them the title's dithering
+/// shows as dots and edges are rough.
+fn most() -> f32 {
+    static MOST: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let asked = std::env::var("VICTORY_UPSCALE_HISTORY").ok().and_then(|v| v.trim().parse::<f32>().ok());
+        asked.filter(|n| n.is_finite()).map_or(16.0, |n| n.clamp(0.0, 16.0))
+    })
+}
+
+/// Where the title's shaders write the light of the sky, by direction (its
+/// "ambient cube", in its own buffer): noted by `crate::draw` at the
+/// dispatch that writes it.
+pub(crate) static SKY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How much of the sky's light is put on surfaces in the place of the
+/// title's ray-traced light: `VICTORY_FILL` (0, the default: none).
+pub(crate) fn filling() -> f32 {
+    static SHARE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SHARE.get_or_init(|| {
+        let asked = std::env::var("VICTORY_FILL").ok().and_then(|v| v.trim().parse::<f32>().ok());
+        asked.filter(|n| n.is_finite()).map_or(0.0, |n| n.clamp(0.0, 8.0))
+    })
+}
+
+/// The light to fill with: the mean of the sky's over the directions, times
+/// [`filling`]. `None` while it is not known.
+fn sky_light() -> Option<[f32; 3]> {
+    let share = filling();
+    #[cfg(feature = "diagnostics")]
+    if crate::capture::knob("nofill") {
+        return None;
+    }
+    let at = SKY.load(Ordering::Relaxed);
+    if share == 0.0 || at == 0 {
+        return None;
+    }
+    let mut bytes = [0u8; 384];
+    if !peek(at as usize, &mut bytes) {
+        return None;
+    }
+    let words: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+    static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    if now > LOGGED.load(Ordering::Relaxed) + 10_000 {
+        LOGGED.store(now, Ordering::Relaxed);
+        tracing::info!(?words, "the light of the sky");
+    }
+    let mut mean = [0f32; 3];
+    for direction in words[..18].as_chunks::<3>().0 {
+        for (m, d) in mean.iter_mut().zip(direction) {
+            *m += d / 6.0;
+        }
+    }
+    // Half of its blue: what rooms and streets give back is not the sky's.
+    let grey = mean[0] * 0.2126 + mean[1] * 0.7152 + mean[2] * 0.0722;
+    let mean = mean.map(|m| (m + grey) / 2.0);
+    #[cfg(feature = "diagnostics")]
+    let share = ["e0", "e1", "e2", "e3", "e4", "e5", "e6"]
+        .iter()
+        .position(|name| crate::capture::knob(name))
+        .map_or(share, |n| 10f32.powi(-(n as i32)) * if crate::capture::knob("x3") { 3.0 } else { 1.0 });
+    mean.iter().all(|m| m.is_finite() && *m >= 0.0).then(|| mean.map(|m| m * share))
+}
+
 fn pass() -> Option<&'static Pass> {
     static PASS: std::sync::OnceLock<Option<Pass>> = std::sync::OnceLock::new();
     PASS.get_or_init(|| match make() {
@@ -184,10 +293,8 @@ fn pass() -> Option<&'static Pass> {
     .as_ref()
 }
 
-fn make() -> windows::core::Result<Pass> {
-    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    let code = crate::host::compile(SOURCE, s!("main"), s!("cs_5_1"))?;
-    let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+fn pipeline(device: &ID3D12Device, source: &'static str) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
+    let code = crate::host::compile(source, s!("main"), s!("cs_5_1"))?;
     // SAFETY: plain object creation; the root signature is in the shader.
     unsafe {
         let root: ID3D12RootSignature = device.CreateRootSignature(0, &code[..])?;
@@ -199,6 +306,19 @@ fn make() -> windows::core::Result<Pass> {
             },
             ..Default::default()
         })?;
+        Ok((root, pso))
+    }
+}
+
+fn make() -> windows::core::Result<Pass> {
+    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+    let (root, pso) = pipeline(device, SOURCE)?;
+    let fill = (filling() > 0.0).then(|| pipeline(device, FILL)).and_then(|made| {
+        made.inspect_err(|e| tracing::warn!(error = %e, "no pass of ours for the light of the sky")).ok()
+    });
+    let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    // SAFETY: plain object creation.
+    unsafe {
         let views: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: kind,
@@ -209,6 +329,7 @@ fn make() -> windows::core::Result<Pass> {
         Ok(Pass {
             root,
             pso,
+            fill,
             cpu: views.GetCPUDescriptorHandleForHeapStart().ptr,
             gpu: views.GetGPUDescriptorHandleForHeapStart().ptr,
             step: device.GetDescriptorHandleIncrementSize(kind),
@@ -269,6 +390,177 @@ fn read_as(format: DXGI_FORMAT) -> DXGI_FORMAT {
     })
 }
 
+/// What the title's last call named (colour, depth, size rendered, whether
+/// depth grows away): the scene [`fill_scene`] lights.
+static VIEW: Mutex<Option<(usize, usize, [u32; 2], bool, f32)>> = Mutex::new(None);
+
+/// The size of the scene the title last had upscaled.
+pub(crate) fn scene_size() -> Option<[u32; 2]> {
+    VIEW.lock().unwrap_or_else(|e| e.into_inner()).map(|v| v.2)
+}
+
+/// When [`fill_scene`] last lit the scene before the title metered it (ms,
+/// 0: never): the upscale does not light it again then.
+static METERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Records, before the title's draw that meters the scene, the light the
+/// title did not trace, into the scene itself: the exposure is taken with
+/// it, and what is drawn afterwards (glass, smoke) lies over it.
+pub(crate) fn fill_scene(list: &HostList) -> bool {
+    let Some((colour, depth, render, far_is_one, pre_exposure)) = *VIEW.lock().unwrap_or_else(|e| e.into_inner()) else {
+        return false;
+    };
+    let done = || -> Option<()> {
+        let (host, pass) = (host()?, pass()?);
+        if !crate::resource::is_texture(colour) || !crate::resource::is_texture(depth) {
+            return None;
+        }
+        let scene = crate::resource::host_resource(colour as This)?;
+        // SAFETY: a live resource.
+        let desc = unsafe { scene.GetDesc() };
+        let size = [desc.Width as u32, desc.Height];
+        if desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || desc.DepthOrArraySize != 1 {
+            return None;
+        }
+        let to = fill(list, host, pass, (colour, depth), size, (render, far_is_one, pre_exposure))?;
+        const FROM: u32 = 0x800;
+        const TO: u32 = 0x400;
+        crate::list::ensure_state(list, colour as This, TO);
+        let (read, copy) = (D3D12_RESOURCE_STATES(READ as i32), D3D12_RESOURCE_STATES(FROM as i32));
+        let at = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed for the call below only.
+            pResource: unsafe { std::mem::transmute_copy(r) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        // SAFETY: an open list and live textures of one size and format.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(&to, read, copy)]);
+            list.list.CopyTextureRegion(&at(scene), 0, 0, 0, &at(&to), None);
+            list.list.ResourceBarrier(&[transition(&to, copy, read)]);
+        }
+        Some(())
+    }()
+    .is_some();
+    if done {
+        METERED.store(crate::host::now_ms().max(1), Ordering::Relaxed);
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        static WAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = crate::host::now_ms();
+        if WAS.swap(done, Ordering::Relaxed) != done || now > LAST.load(Ordering::Relaxed) + 5000 {
+            LAST.store(now, Ordering::Relaxed);
+            let size = |this: This| {
+                crate::resource::host_resource(this).map(|t| {
+                    // SAFETY: a live resource.
+                    let d = unsafe { t.GetDesc() };
+                    (d.Width, d.Height, d.Format.0)
+                })
+            };
+            let surface = crate::draw::surface_colours();
+            tracing::info!(
+                done,
+                light = ?sky_light(),
+                colour = ?size(colour as This),
+                depth = ?size(depth as This),
+                surface = ?surface.map(|s| (s, size(s))),
+                ?render,
+                "the scene lit before it is metered"
+            );
+        }
+    }
+    done
+}
+
+/// Records [`FILL`] over the scene `colour` with `depth`: the texture with
+/// the result, left to be read. `None` while what it needs is not known.
+fn fill(
+    list: &HostList,
+    host: &crate::host::Host,
+    pass: &Pass,
+    (colour, depth): (usize, usize),
+    size: [u32; 2],
+    (render, far_is_one, pre_exposure): ([u32; 2], bool, f32),
+) -> Option<ID3D12Resource> {
+    static FILLED: Mutex<Option<([u32; 2], ID3D12Resource)>> = Mutex::new(None);
+    let light = sky_light()?;
+    let (root, pso) = pass.fill.as_ref()?;
+    let surface = crate::draw::surface_colours()?;
+    let textures = [colour as This, depth as This, surface];
+    let mut hosts = Vec::with_capacity(3);
+    for this in textures {
+        let texture = crate::resource::host_resource(this)?;
+        // SAFETY: a live resource.
+        let desc = unsafe { texture.GetDesc() };
+        if [desc.Width as u32, desc.Height] != size {
+            return None;
+        }
+        hosts.push(texture);
+    }
+    let mut kept = FILLED.lock().unwrap_or_else(|e| e.into_inner());
+    if kept.as_ref().is_none_or(|k| k.0 != size) {
+        // (the one before may still be in a flight: never released)
+        std::mem::forget(kept.replace((size, history_texture(&host.device, size)?)));
+    }
+    let to = kept.as_ref()?.1.clone();
+    for this in textures {
+        list.twin_use(this, false, false);
+        crate::list::ensure_state(list, this, READ);
+    }
+    let render = [render[0].min(size[0]), render[1].min(size[1])];
+    let mut words = [0u32; 8];
+    for (w, l) in words.iter_mut().zip(light) {
+        *w = (l * pre_exposure.max(0.0)).to_bits();
+    }
+    words[3] = f32::from(u8::from(far_is_one)).to_bits();
+    words[4..7].copy_from_slice(&[render[0], render[1], crate::frame::current() as u32]);
+    let slot = pass.next.fetch_add(1, Ordering::Relaxed) % SETS * VIEWS;
+    let cpu = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: pass.cpu + ((slot + i) * pass.step) as usize,
+    };
+    for (i, texture) in hosts.iter().enumerate() {
+        // SAFETY: a live resource and a slot of our heap.
+        unsafe {
+            let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: read_as(texture.GetDesc().Format),
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV {
+                        MipLevels: 1,
+                        ..Default::default()
+                    },
+                },
+            };
+            host.device.CreateShaderResourceView(*texture, Some(&view), cpu(i as u32));
+        }
+    }
+    let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+        ..Default::default()
+    };
+    let (read, write) = (D3D12_RESOURCE_STATES(READ as i32), D3D12_RESOURCE_STATES(WRITE as i32));
+    let l = &list.list;
+    // SAFETY: an open list; live resources; objects that live as long as
+    // the process.
+    unsafe {
+        host.device.CreateUnorderedAccessView(&to, None, Some(&view), cpu(3));
+        l.ResourceBarrier(&[transition(&to, read, write)]);
+        l.SetDescriptorHeaps(&[Some(pass.views.clone())]);
+        l.SetComputeRootSignature(root);
+        l.SetPipelineState(pso);
+        l.SetComputeRoot32BitConstants(0, 8, words.as_ptr().cast(), 0);
+        let ptr = pass.gpu + u64::from(slot * pass.step);
+        l.SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE { ptr });
+        l.Dispatch(render[0].div_ceil(8), render[1].div_ceil(8), 1);
+        l.ResourceBarrier(&[transition(&to, write, read)]);
+    }
+    Some(to)
+}
+
 /// Records the upscale into the title's list: whether it was.
 /// shortcut: one context (one view) at a time, as the title uses it.
 pub fn record(d: &Dispatch) -> bool {
@@ -311,7 +603,7 @@ fn record_into(list: &HostList, d: &Dispatch) -> Option<()> {
     }
     let h = history.as_mut()?;
     let (before, after) = (h.last, 1 - h.last);
-    let reset = d.reset || h.fresh;
+    let reset = d.reset || h.fresh || most() == 0.0;
     let ratio = if h.pre_exposure > 0.0 && d.pre_exposure > 0.0 {
         d.pre_exposure / h.pre_exposure
     } else {
@@ -331,11 +623,22 @@ fn record_into(list: &HostList, d: &Dispatch) -> Option<()> {
     constants[4..6].copy_from_slice(&d.jitter);
     constants[6..8].copy_from_slice(&d.motion_scale);
     constants[8] = f32::from(u8::from(reset));
+    constants[14] = most();
     constants[9] = ratio;
     constants[10] = f32::from(u8::from(d.far_is_one));
     constants[11] = f32::from(u8::from(motion.is_some()));
     constants[12] = d.size[0] as f32;
     constants[13] = d.size[1] as f32;
+    *VIEW.lock().unwrap_or_else(|e| e.into_inner()) = Some((d.colour, d.depth, render, d.far_is_one, d.pre_exposure));
+    // The picture with the light the title did not trace, if the scene was
+    // not lit before the title metered it.
+    let metered = METERED.load(Ordering::Relaxed);
+    let filled = (metered == 0 || crate::host::now_ms() > metered + 3000)
+        .then(|| {
+            let size = [colour_desc.Width as u32, colour_desc.Height];
+            fill(list, host, pass, (d.colour, d.depth), size, (render, d.far_is_one, d.pre_exposure))
+        })
+        .flatten();
     // The title's textures to the states the pass uses them in.
     for texture in [d.colour, d.depth].into_iter().chain(motion.map(|_| d.motion)) {
         list.twin_use(texture as This, false, false);
@@ -373,7 +676,7 @@ fn record_into(list: &HostList, d: &Dispatch) -> Option<()> {
         // SAFETY: a live resource and a slot of our heap.
         unsafe { device.CreateUnorderedAccessView(texture, None, Some(&view), cpu(i)) };
     };
-    srv(colour, 0);
+    srv(filled.as_ref().unwrap_or(colour), 0);
     srv(depth, 1);
     srv(motion.unwrap_or(colour), 2);
     srv(&h.textures[before], 3);

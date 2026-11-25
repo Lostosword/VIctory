@@ -50,7 +50,7 @@ pub(crate) fn listed(n: u64) -> bool {
     if n == WHITE.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    if n == ASKED.load(std::sync::atomic::Ordering::Relaxed) {
+    if (ASKED.load(std::sync::atomic::Ordering::Relaxed)..ASKED.load(std::sync::atomic::Ordering::Relaxed).saturating_add(3)).contains(&n) {
         return true;
     }
     named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))

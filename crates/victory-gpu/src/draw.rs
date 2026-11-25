@@ -582,6 +582,12 @@ pub(crate) fn geometry_shown() -> Option<usize> {
     *WHICH.get_or_init(|| std::env::var("VICTORY_GEOMETRIE").ok()?.trim().parse().ok())
 }
 
+/// The program that writes the light of the sky (`VICTORY_FILL`).
+const WRITES_SKY: &str = "fb9c7f430da14c4c";
+
+/// The program of the draw the exposure is metered from (`VICTORY_FILL`).
+const METERS_SCENE: &str = "6800ca4531a415e8";
+
 /// The targets (title resources) the largest geometry pass was drawn into.
 static GEOMETRY: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
@@ -593,6 +599,10 @@ fn note_geometry(targets: &[usize]) {
     // SAFETY: a live resource.
     let d = unsafe { first.GetDesc() };
     if d.Format.0 != TYPELESS_RGBA8 || d.Width < 900 {
+        return;
+    }
+    // (surfaces are also drawn beside the scene, 1024 texels square)
+    if crate::upscale::scene_size().is_some_and(|size| size != [d.Width as u32, d.Height]) {
         return;
     }
     let mut kept = GEOMETRY.lock().unwrap_or_else(|e| e.into_inner());
@@ -607,6 +617,13 @@ pub(crate) fn geometry_target() -> Option<This> {
     let n = geometry_shown()?;
     let kept = GEOMETRY.lock().unwrap_or_else(|e| e.into_inner());
     let &t = kept.get(n)?;
+    crate::resource::is_texture(t).then_some(t as This)
+}
+
+/// The target that holds the colours of the surfaces, if it is known.
+pub(crate) fn surface_colours() -> Option<This> {
+    let kept = GEOMETRY.lock().unwrap_or_else(|e| e.into_inner());
+    let &t = kept.first()?;
     crate::resource::is_texture(t).then_some(t as This)
 }
 
@@ -789,7 +806,7 @@ impl State {
             crate::capture::note_target(record.resource);
             rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
         }
-        if geometry_shown().is_some() && self.targets.len() >= 3 {
+        if (geometry_shown().is_some() || crate::upscale::filling() > 0.0) && self.targets.len() >= 3 {
             note_geometry(&self.targets);
         }
         self.depth = 0;
@@ -1048,6 +1065,10 @@ impl State {
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
+        }
+        if crate::upscale::filling() > 0.0 && p.name.contains(METERS_SCENE) && crate::upscale::fill_scene(list) {
+            self.host_state_lost();
+            self.pass_may_begin();
         }
         if p.rects && self.topology != RECTANGLES {
             // Its geometry stage would turn each triangle into a rectangle.
@@ -2379,6 +2400,29 @@ impl State {
         found
     }
 
+    /// Notes where the dispatch about to run writes the light of the sky
+    /// (`crate::upscale`): the first buffer it writes through a table.
+    fn note_sky(&self, p: &crate::pipeline::host::HostPipeline) {
+        for stage in &p.stages {
+            for u in &stage.translated().used {
+                if u.root != RootType::Table {
+                    continue;
+                }
+                let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                    continue;
+                };
+                let view = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4);
+                if let Some(view @ crate::descriptor::View::Unordered(..)) = view
+                    && let Some((at, len)) = crate::descriptor::host::buffer_range(&view)
+                    && len >= 384
+                {
+                    crate::upscale::SKY.store(at, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
@@ -2435,6 +2479,31 @@ impl State {
                 crate::pipeline::builder_off("one of its dispatches could not be bound");
             }
             return;
+        }
+        #[cfg(feature = "diagnostics")]
+        if ["f7f9f22551967b84", "fb9c7f430da14c4c", "e622b718b6d9b057", "214cae4f6e1ef745", "fc7fa31c"].iter().any(|h| p.name.contains(h))
+            && crate::capture::knob("cbs")
+        {
+            for stage in &p.stages {
+                for u in &stage.translated().used {
+                    let view = match (u.root, self.roots_ref(true).get(usize::from(u.slot))) {
+                        (RootType::Table, Some(Root::Table(table))) => {
+                            crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+                        }
+                        _ => None,
+                    };
+                    if let Some(crate::descriptor::View::Constant(at, len)) = view {
+                        let mut bytes = vec![0u8; (len as usize).min(4096)];
+                        if crate::host::read_into(at as *const u8, &mut bytes) {
+                            let w: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+                            tracing::info!("CBS {} s{}+{} {len}: {w:?}", p.name, u.slot, u.table_offset_dwords);
+                        }
+                    }
+                }
+            }
+        }
+        if crate::upscale::filling() > 0.0 && p.name.contains(WRITES_SKY) {
+            self.note_sky(p);
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
