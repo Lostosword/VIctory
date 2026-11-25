@@ -284,7 +284,27 @@ pub(crate) fn bound_ahead(
 }
 
 /// The bytes of argument buffers clamped in one pass by [`bound_block`].
-pub(crate) const BLOCK: u64 = 4096;
+/// 64 KiB unless `VICTORY_INDIRECT_BLOCK_KB` says another power of two (4 to
+/// 256). Every block more is a pass of ours that cuts a render pass in two:
+/// of 4 KiB, 4,079 render passes of 5,683 went on with the targets of the
+/// one before; of 64 KiB, half as many, and the frame 172 ms for 200.
+pub(crate) fn block() -> u64 {
+    #[cfg(feature = "diagnostics")]
+    for (name, kb) in [("b4", 4), ("b16", 16), ("b64", 64), ("b256", 256)] {
+        if crate::capture::knob(name) {
+            return kb << 10;
+        }
+    }
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("VICTORY_INDIRECT_BLOCK_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|kb| kb.is_power_of_two() && (4..=256).contains(kb))
+            .unwrap_or(64)
+            << 10
+    })
+}
 
 /// How far apart a block's records are taken to be: the title keeps the
 /// ones it draws 16 bytes apart or a multiple of it.
@@ -315,14 +335,17 @@ pub(crate) fn bound_block(
 }
 
 /// Draws recorded from here on wait for what [`bound_block`] wrote.
-pub(crate) fn wait_for_block(list: &HostList, arena: &ID3D12Resource) {
+pub(crate) fn wait_for_block(list: &HostList) {
     #[cfg(feature = "diagnostics")]
     crate::span::span!("wait_for_block");
     let (args, write) = (D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    // SAFETY: an open list and a live buffer in the argument state.
+    let arenas = list.indirect_arenas();
+    let there: Vec<_> = arenas.iter().map(|arena| transition(arena, args, write)).collect();
+    let back: Vec<_> = std::iter::once(uav_barrier()).chain(arenas.iter().map(|arena| transition(arena, write, args))).collect();
+    // SAFETY: an open list and live buffers in the argument state.
     unsafe {
-        list.list.ResourceBarrier(&[transition(arena, args, write)]);
-        list.list.ResourceBarrier(&[uav_barrier(), transition(arena, write, args)]);
+        list.list.ResourceBarrier(&there);
+        list.list.ResourceBarrier(&back);
     }
 }
 

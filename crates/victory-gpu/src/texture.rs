@@ -75,6 +75,8 @@ pub(crate) struct Staging {
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
+    /// Looks in a row that found the memory as it was.
+    same: u32,
     hash: Option<[u64; 2]>,
     /// The frame it was last looked at in, where writes are not tracked.
     looked: Option<u64>,
@@ -925,6 +927,7 @@ impl Staging {
     }
 
     fn refresh_timed(&self) -> usize {
+        const STILL: u32 = 64;
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
@@ -941,6 +944,12 @@ impl Staging {
                 return 0;
             }
             last.looked = Some(frame);
+            // One found as it was for long is looked at every fourth frame,
+            // the textures taking turns: 70 MB were hashed every frame, 5 to
+            // 7 ms, nearly all of it unchanged since it was loaded.
+            if last.same >= STILL && !(frame.wrapping_add((start >> 16) as u64)).is_multiple_of(4) {
+                return 0;
+            }
         }
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
@@ -1037,8 +1046,10 @@ impl Staging {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
+                    last.same = last.same.saturating_add(1);
                     return size;
                 }
+                last.same = 0;
                 last.hash = Some(hash);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
@@ -1053,8 +1064,10 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
+            last.same = last.same.saturating_add(1);
             return size;
         }
+        last.same = 0;
         last.hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]

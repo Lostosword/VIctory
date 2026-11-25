@@ -1603,27 +1603,39 @@ impl State {
         // at best); all of them every 16 passes, because a view of a
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        type Ranges = crate::fast::FastMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
         static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
         let (passes, ranges) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
-        let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+            .or_insert_with(|| (0, Ranges::default()));
+        let mut slots = host.buffer_changes();
+        // A sixteenth of all of them with each pass, not all of them with
+        // every sixteenth (27,000 slots, 100 ms of one thread at once).
+        const TURNS: u64 = 16;
+        if *passes == 0 {
             ranges.clear();
-            host.buffer_slots()
+            slots = host.buffer_slots();
         } else {
-            changed
-        };
+            let turn = (*passes % TURNS) as u32;
+            ranges.retain(|&index, _| index % TURNS as u32 != turn);
+            slots.extend(host.buffer_slots().into_iter().filter(|&index| index % TURNS as u32 == turn));
+            slots.sort_unstable();
+            slots.dedup();
+        }
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let slots_span = crate::span::Span::new({
+            static SITE: crate::span::Site = crate::span::Site::new("heap_buffers: slots");
+            &SITE
+        });
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
@@ -1658,15 +1670,21 @@ impl State {
             }
             ranges.insert(index, (shadow, address, address + len));
         }
+        #[cfg(feature = "diagnostics")]
+        drop(slots_span);
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
+        let mut spans: crate::fast::FastMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+            crate::fast::FastMap::default();
+        {
+            #[cfg(feature = "diagnostics")]
+            crate::span::span!("heap_buffers: spans");
+            for (shadow, from, to) in ranges.values() {
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+                span.1 = span.1.min(*from);
+                span.2 = span.2.max(*to);
+            }
         }
         drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
@@ -1680,8 +1698,13 @@ impl State {
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
+        #[cfg(feature = "diagnostics")]
+        let refresh_span = crate::span::Span::new({
+            static SITE: crate::span::Site = crate::span::Site::new("heap_buffers: refresh");
+            &SITE
+        });
         for (shadow, from, to) in spans.values() {
-            if shadow.unwatched() {
+            if !shadow.in_place() && shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
                 // (`shadow::let_go_idle`) has never been refreshed.
                 let key = shadow.id() as usize;
@@ -1704,6 +1727,8 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        #[cfg(feature = "diagnostics")]
+        drop(refresh_span);
         let textures_began = std::time::Instant::now();
         self.heap_textures(list, heap, host);
         HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -2295,7 +2320,8 @@ impl State {
     ) -> Option<(ID3D12Resource, u64)> {
         #[cfg(feature = "diagnostics")]
         crate::span::span!("clamped_block");
-        use crate::indirect::{BLOCK, INDEXED_RECORD, block_step};
+        use crate::indirect::{INDEXED_RECORD, block, block_step};
+        let size = block();
         if list.first_use(usize::MAX - 0x7b) {
             self.clamped.clear();
         }
@@ -2307,7 +2333,7 @@ impl State {
             1 => 20,
             _ => 12,
         };
-        let block = offset / BLOCK * BLOCK;
+        let block = offset / size * size;
         let phase = offset % step;
         let key = (args.id(), kind, indexed, block, phase);
         let find = |b: &Block| {
@@ -2321,7 +2347,7 @@ impl State {
         if let Some(b) = self.clamped.get(&key) {
             let found = find(b);
             if found.is_some() && (self.arguments_stale || block_test() & 8 != 0) {
-                crate::indirect::wait_for_block(list, &b.arena);
+                crate::indirect::wait_for_block(list);
                 self.arguments_stale = false;
             }
             return found;
@@ -2330,7 +2356,7 @@ impl State {
         let start = arguments - (offset - block).min(arguments - args.span().0);
         let low = offset - (arguments - start);
         let first = low + (phase + step - low % step) % step;
-        let end = (block + BLOCK).min(offset + args.left(arguments));
+        let end = (block + size).min(offset + args.left(arguments));
         let records = (end.checked_sub(first)?.checked_sub(bytes)? + 1).div_ceil(step);
         if first > offset || records == 0 {
             return None;
@@ -2345,6 +2371,10 @@ impl State {
         self.arguments_stale = false;
         let made = Block { arena, at, first, records };
         let found = find(&made);
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::knob("blocs") {
+            tracing::info!("BLOC list={:p} args={} kind={kind} block={block:#x} phase={phase} records={records} offset={offset:#x} len={}", list, args.id(), args.span().1);
+        }
         self.clamped.insert(key, made);
         found
     }

@@ -850,7 +850,7 @@ pub(crate) struct HostList {
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// What argument blocks are clamped into, and the bytes given of it
     /// ([`HostList::indirect_arena`]).
-    indirect_arena: Mutex<Option<(ID3D12Resource, u64)>>,
+    indirect_arena: Mutex<(Vec<ID3D12Resource>, usize, u64)>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -6242,26 +6242,35 @@ impl HostList {
     /// Room for `size` bytes of clamped indirect arguments, the list's own
     /// until it is reset: the buffer, the offset in it, and whether the list
     /// has used the buffer before (it is then in the argument state). `None`
-    /// when the arena is full.
+    /// for more than a chunk holds.
     pub(crate) fn indirect_arena(&self, size: u64) -> Option<(ID3D12Resource, u64, bool)> {
-        const ARENA: u64 = 1 << 20;
-        let mut slot = self.indirect_arena.lock().unwrap_or_else(|e| e.into_inner());
-        if slot.is_none() {
-            let buffer = host()?.uav_buffer(ARENA)?;
-            name(&buffer, || "indirect arguments, by the block".to_owned());
-            *slot = Some((buffer, 0));
+        const CHUNK: u64 = 1 << 20;
+        // (chunks, the one filled now, the bytes of it taken)
+        let mut arena = self.indirect_arena.lock().unwrap_or_else(|e| e.into_inner());
+        if self.first_use(usize::MAX - 0x79) {
+            (arena.1, arena.2) = (0, 0);
         }
-        let first = self.first_use(usize::MAX - 0x79);
-        let (buffer, used) = slot.as_mut()?;
-        if first {
-            *used = 0;
-        }
-        let at = *used;
-        if at + size > ARENA {
+        if size > CHUNK {
             return None;
         }
-        *used += size;
-        Some((buffer.clone(), at, at > 0))
+        if arena.2 + size > CHUNK {
+            (arena.1, arena.2) = (arena.1 + 1, 0);
+        }
+        if arena.1 == arena.0.len() {
+            let buffer = host()?.uav_buffer(CHUNK)?;
+            name(&buffer, || "indirect arguments, by the block".to_owned());
+            arena.0.push(buffer);
+        }
+        let (buffer, at) = (&arena.0[arena.1], arena.2);
+        let buffer = buffer.clone();
+        arena.2 += size;
+        Some((buffer, at, at > 0))
+    }
+
+    /// The buffers [`HostList::indirect_arena`] gave room in since the reset.
+    pub(crate) fn indirect_arenas(&self) -> Vec<ID3D12Resource> {
+        let arena = self.indirect_arena.lock().unwrap_or_else(|e| e.into_inner());
+        arena.0[..arena.0.len().min(arena.1 + 1)].to_vec()
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -7640,6 +7649,8 @@ impl Host {
         // Where the card's memory is the PC's (Apple's): what the title and
         // the rest of the system need is not the card's to fill.
         if let Some(most) = shared_memory_budget() {
+            #[cfg(feature = "diagnostics")]
+            let most = if crate::capture::knob("card8") { 8000 << 20 } else { most };
             own.Budget = own.Budget.min(most);
             shared.Budget = shared.Budget.min(most);
             // Title memory in place is counted as the card's, but is the
