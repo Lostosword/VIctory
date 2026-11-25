@@ -674,6 +674,7 @@ pub(crate) fn save(now: bool) {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            declared = super::make::DECLARED.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
@@ -738,6 +739,39 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
 pub(crate) fn wanted_early(key: &str) -> bool {
     used().as_ref().is_some_and(|s| s.contains(key))
+}
+
+/// The keys of pipelines a run has prepared (`VICTORY_PREPARE`), one a line.
+const PREPARED_FILE: &str = "prepared-pipelines.txt";
+static PREPARED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+fn prepared_set() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
+    let mut set = PREPARED.lock().unwrap_or_else(|e| e.into_inner());
+    if set.is_none() {
+        let listed = DIR
+            .get()
+            .and_then(|d| std::fs::read_to_string(d.join(PREPARED_FILE)).ok())
+            .unwrap_or_default();
+        *set = Some(listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect());
+    }
+    set
+}
+
+/// Whether an earlier run prepared the title pipeline with `key`.
+pub(crate) fn prepared(key: &str) -> bool {
+    prepared_set().as_ref().is_some_and(|s| s.contains(key))
+}
+
+/// The title pipeline with `key` is prepared.
+pub(crate) fn note_prepared(key: &str) {
+    use std::io::Write;
+    let mut set = prepared_set();
+    if set.get_or_insert_with(HashSet::new).insert(key.to_owned())
+        && let Some(dir) = DIR.get()
+        && let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(PREPARED_FILE))
+    {
+        let _ = writeln!(file, "{key}");
+    }
 }
 
 /// A draw or dispatch requested the title pipeline with `key`.

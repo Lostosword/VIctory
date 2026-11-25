@@ -146,6 +146,8 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    crate::span::span!("list call (rest)");
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
@@ -633,6 +635,8 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    #[cfg(feature = "diagnostics")]
+    crate::span::span!("l:close");
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
@@ -640,6 +644,8 @@ extern "system" fn close(this: This) -> HRESULT {
     S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
+    #[cfg(feature = "diagnostics")]
+    crate::span::span!("l:reset");
     if allocator.is_null() {
         return E_INVALIDARG;
     }
@@ -753,6 +759,10 @@ const UAV_BARRIER: Barrier = Barrier {
 
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
+    #[cfg(feature = "diagnostics")]
+    crate::span::span!("l:barrier");
+    #[cfg(windows)]
+    with_state(this, |_, state| state.pass_may_begin());
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
@@ -793,9 +803,20 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 /// Moves a title texture's host copy to `state` in the list, if needed.
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
+    #[cfg(feature = "diagnostics")]
+    crate::span::span!("ensure_state");
+    if let Some(copy) = crate::resource::host_copy(resource) {
+        ensure_state_of(list, copy, state);
+    }
+}
+
+/// [`ensure_state`] of a host copy already at hand.
+#[cfg(windows)]
+pub(crate) fn ensure_state_of(list: &crate::host::HostList, copy: std::sync::Arc<crate::resource::HostTexture>, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-    if let Some((texture, before)) = list.transition(resource, state) {
-        let state = crate::host::legal_state(texture, state);
+    let legal = crate::host::legal_for(copy.flags, state);
+    if let Some((texture, before)) = list.transition_of(copy, state) {
+        let state = legal;
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
@@ -820,7 +841,71 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
-/// Buffer to buffer: both are host memory, copied at submission.
+/// Whether copies between title buffers that are both in place
+/// (`crate::inplace`) are the card's own, where the list has them, and not
+/// the CPU's before the list runs: a copy of what a shader of the same list
+/// or submission writes then reads it, as on the console (the CPU's gave
+/// what the source held before). On; `VICTORY_CARD_COPIES=0` leaves them to
+/// the CPU.
+#[cfg(windows)]
+fn card_copies() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if crate::capture::knob("cpucopies") {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_COPIES").is_none_or(|v| v != "0"))
+}
+
+/// Records the copy of `len` bytes of title memory from `from` to `to` on
+/// the card, if both are in place. False if it is the CPU's to make.
+#[cfg(windows)]
+fn copy_on_card(this: This, list: &crate::host::HostList, to: *mut u8, from: *const u8, len: u64) -> bool {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_STATE_COPY_DEST as DEST, D3D12_RESOURCE_STATE_COPY_SOURCE as SOURCE,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS as UNORDERED,
+    };
+    let (to, from) = (to as u64, from as u64);
+    if len == 0 || !card_copies() || to.abs_diff(from) < len {
+        return false;
+    }
+    let (Some(d), Some(s)) = (crate::shadow::find(to, len), crate::shadow::find(from, len)) else {
+        return false;
+    };
+    if !d.in_place() || !s.in_place() || d.left(to) < len || s.left(from) < len {
+        return false;
+    }
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("card copy {len:#x} from {from:#x} to {to:#x}"));
+    // Other commands than a draw's: the pass they stand in ends.
+    with_state(this, |_, state| state.pass_may_begin());
+    list.hold_in_place(&d);
+    list.hold_in_place(&s);
+    let one = windows::core::Interface::as_raw(&d.buffer) == windows::core::Interface::as_raw(&s.buffer);
+    wait_for_writes(list);
+    // SAFETY: an open list, live buffers, both ranges inside them.
+    unsafe {
+        if !one {
+            list.list.ResourceBarrier(&[
+                crate::host::transition(&s.buffer, UNORDERED, SOURCE),
+                crate::host::transition(&d.buffer, UNORDERED, DEST),
+            ]);
+        }
+        list.list.CopyBufferRegion(&d.buffer, d.offset(to), &s.buffer, s.offset(from), len);
+        if !one {
+            list.list.ResourceBarrier(&[
+                crate::host::transition(&s.buffer, SOURCE, UNORDERED),
+                crate::host::transition(&d.buffer, DEST, UNORDERED),
+            ]);
+        }
+    }
+    wait_for_writes(list);
+    d.gpu_writes(list, to, len);
+    true
+}
+
+/// Buffer to buffer: both are host memory, copied at submission, or by the
+/// card where both are in place ([`card_copies`]).
 extern "system" fn copy_buffer_region(
     this: This,
     dst: This,
@@ -834,7 +919,11 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
-        list.defer_copy(to, from, len as usize);
+        if !copy_on_card(this, list, to, from, len) {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("cpu copy {len:#x} from {from:?} to {to:?}"));
+            list.defer_copy(to, from, len as usize);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
@@ -856,6 +945,8 @@ fn unlike(dst: This, src: This) -> bool {
 }
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    #[cfg(windows)]
+    with_state(this, |_, state| state.pass_may_begin());
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -890,7 +981,11 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            if !copy_on_card(this, list, to, from, a.min(b)) {
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| format!("cpu copy {:#x} from {from:?} to {to:?}", a.min(b)));
+                list.defer_copy(to, from, a.min(b) as usize);
+            }
         }
     }
     #[cfg(not(windows))]
@@ -923,6 +1018,8 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    #[cfg(windows)]
+    with_state(this, |_, state| state.pass_may_begin());
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1150,6 +1247,8 @@ extern "system" fn resolve(
     format: u32,
 ) {
     #[cfg(windows)]
+    with_state(this, |_, state| state.pass_may_begin());
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
@@ -1226,6 +1325,8 @@ extern "system" fn clear_rtv(
     rects: *const Rect,
 ) {
     #[cfg(windows)]
+    with_state(this, |_, state| state.pass_may_begin());
+    #[cfg(windows)]
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
         else {
@@ -1276,6 +1377,8 @@ extern "system" fn clear_dsv(
     rects: *const Rect,
 ) {
     #[cfg(windows)]
+    with_state(this, |_, state| state.pass_may_begin());
+    #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
@@ -1319,7 +1422,12 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && dst != 0
         && src != 0
     {
+        if copy_on_card(this, list, dst as *mut u8, src as *const u8, len) {
+            return;
+        }
         let len = len as usize;
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("cpu memory copy {len:#x} from {src:#x} to {dst:#x}"));
         list.defer(move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
@@ -1410,6 +1518,8 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 };
 
 extern "system" fn set_pipeline(this: This, pipeline: This) {
+    #[cfg(feature = "diagnostics")]
+    crate::span::span!("l:set_pipeline");
     crate::pipeline::bound(pipeline);
     #[cfg(windows)]
     with_state(this, |_, state| state.set_pipeline(pipeline));
@@ -1449,6 +1559,10 @@ pub(crate) fn wait_for_writes(list: &crate::host::HostList) {
 /// title orders its compute passes with these, so each is a wait for
 /// earlier shader writes ([`sync_level`]).
 extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(feature = "diagnostics")]
+    crate::span::span!("l:sync");
+    #[cfg(windows)]
+    with_state(this, |_, state| state.pass_may_begin());
     #[cfg(windows)]
     if sync_level() > 0
         && let Some(list) = host_list(this)
@@ -1993,6 +2107,10 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    #[cfg(feature = "diagnostics")]
+    crate::span::span!("l:barrier_groups");
+    #[cfg(windows)]
+    with_state(this, |_, state| state.pass_may_begin());
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {

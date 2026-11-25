@@ -1130,6 +1130,10 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    /// Its resource flags (asked of the host once).
+    pub(crate) flags: u32,
+    /// A number no other host texture has or had.
+    pub(crate) id: u64,
     /// The bytes the host gives it.
     bytes: u64,
     /// Whether its contents come from title memory ([`fills`]): counted in
@@ -1964,6 +1968,18 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 }
 
 #[cfg(windows)]
+fn next_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(windows)]
+fn flags_of(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u32 {
+    // SAFETY: a plain query.
+    unsafe { texture.GetDesc() }.Flags.0 as u32
+}
+
+#[cfg(windows)]
 impl HostTexture {
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1977,6 +1993,8 @@ impl HostTexture {
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
+            flags: flags_of(&texture),
+            id: next_id(),
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
@@ -1994,6 +2012,8 @@ impl HostTexture {
     ) -> HostTexture {
         HOST_TEXTURES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         HostTexture {
+            flags: flags_of(&texture),
+            id: next_id(),
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes: 0,
@@ -2056,6 +2076,50 @@ pub(crate) fn host_resource<'a>(
     // list and no slot holds and that nothing asked for in seconds (the
     // asking just made is noted under the same lock).
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
+}
+
+/// Width, height and format of texture `this` (`None` for a buffer), for
+/// `crate::texback`'s kinds.
+#[cfg(windows)]
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    (r.desc.dimension != BUFFER).then_some((r.desc.width, r.desc.height, r.desc.format))
+}
+
+/// Texture `this`'s console layout (one plane), where it lies in title
+/// memory and the bytes that layout takes, for `crate::texback`; `None` for
+/// a buffer, unbacked address 0, or a texture with multiple planes.
+#[cfg(windows)]
+pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Layout, usize, usize)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let at = r.data() as usize;
+    if at == 0 {
+        return None;
+    }
+    let t = texture_layout(&r.desc)?;
+    let [plane] = &t.planes[..] else {
+        return None;
+    };
+    Some((plane.layout.clone(), at, t.size as usize))
+}
+
+/// What a title texture has on the host, its host copy made if need be:
+/// one asking for a caller that needs several of them.
+#[cfg(windows)]
+pub(crate) fn host_side(this: This) -> Option<(std::sync::Arc<HostTexture>, bool)> {
+    if this.is_null() {
+        return None;
+    }
+    hosted(this, true).map(|(copy, twin)| (copy, twin.is_some()))
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -2613,8 +2677,41 @@ pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
 
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
+///
+/// Asked for every placed view a draw reads; a texture once found stays
+/// ([`PLACED_TEXTURES`] loses none), so each thread remembers its answers.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    const REMEMBERED: usize = 1 << 13;
+    type Answer = (u64, [u32; 14], usize);
+    thread_local! {
+        static ANSWERS: std::cell::RefCell<Vec<Answer>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let place = {
+        let words = desc.iter().fold(address, |h, &w| (h.rotate_left(7) ^ u64::from(w)).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        (words >> 51) as usize & (REMEMBERED - 1)
+    };
+    let known = ANSWERS.with_borrow(|answers| {
+        answers
+            .get(place)
+            .filter(|a| a.2 != 0 && a.0 == address && a.1 == *desc)
+            .map(|a| a.2)
+    });
+    if let Some(known) = known {
+        return Some(known as This);
+    }
+    let found = texture_at_tables(address, desc)?;
+    ANSWERS.with_borrow_mut(|answers| {
+        if answers.is_empty() {
+            answers.resize(REMEMBERED, (0, [0; 14], 0));
+        }
+        answers[place] = (address, *desc, found as usize);
+    });
+    Some(found)
+}
+
+#[cfg(windows)]
+fn texture_at_tables(address: u64, desc: &[u32; 14]) -> Option<This> {
     // Words 1 and 13 of the description are the filler of its layout
     // (after the dimension, and at the end): the title leaves there what
     // its stack held, and two views of one texture that differed only in

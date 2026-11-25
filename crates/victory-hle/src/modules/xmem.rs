@@ -238,6 +238,7 @@ fn uncommitted(at: usize, size: usize) {
             known.insert(start + len, b);
         }
         let (from, to) = (a.max(start), b.min(start + len));
+        victory_gpu::title_memory_freeing(from, to - from);
         victory_gpu::title_pages_unmapped(from, to - from);
     }
 }

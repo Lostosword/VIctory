@@ -92,8 +92,25 @@ pub(crate) fn now_ms() -> u64 {
 /// frames begun so far (high half, `crate::frame::current`) and tenths of a
 /// second since the start. Host copies of title memory, staging buffers and
 /// host textures note when they were last used with it.
+///
+/// The tenths are asked of the clock once in 32 notes of a thread (the
+/// clock is a call into Wine, and a frame notes hundreds of thousands): one
+/// that was idle in between notes a use as older than it is, and nothing is
+/// let go by the tenths alone ([`long_ago`]).
 pub(crate) fn moment() -> u64 {
-    (crate::frame::current() << 32) | ((now_ms() / 100) & 0xffff_ffff)
+    thread_local! {
+        static TENTHS: std::cell::Cell<(u32, u64)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    let (left, tenths) = TENTHS.get();
+    let tenths = if left == 0 {
+        let now = (now_ms() / 100) & 0xffff_ffff;
+        TENTHS.set((31, now));
+        now
+    } else {
+        TENTHS.set((left - 1, tenths));
+        tenths
+    };
+    (crate::frame::current() << 32) | tenths
 }
 
 /// Whether `moment` lies at least `ms` milliseconds and `frames` frames
@@ -101,7 +118,7 @@ pub(crate) fn moment() -> u64 {
 /// for seconds, and at many frames per second not for many frames. (A title
 /// that never waits for frames has no frame count: nothing is then idle.)
 pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
-    let now = self::moment();
+    let now = (crate::frame::current() << 32) | ((now_ms() / 100) & 0xffff_ffff);
     let tenths = (now & 0xffff_ffff).saturating_sub(moment & 0xffff_ffff);
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
@@ -191,6 +208,10 @@ fn sweep() {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
     let last = LAST.load(Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    if crate::capture::knob("nosweep") {
+        return;
+    }
     if now < last + 1000
         || LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
@@ -218,6 +239,39 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((started, Retired(Box::new(object))));
+}
+
+/// [`retire`] of a resource a descriptor slot held: some tens of thousands
+/// a frame. A thread hands them over a batch at a time, which only makes
+/// them go later.
+pub(crate) fn retire_resource(resource: ID3D12Resource) {
+    struct Batch(Vec<ID3D12Resource>);
+    impl Drop for Batch {
+        fn drop(&mut self) {
+            hand_over(std::mem::take(&mut self.0));
+        }
+    }
+    fn hand_over(resources: Vec<ID3D12Resource>) {
+        if resources.is_empty() {
+            return;
+        }
+        RETIREMENTS[1].fetch_add(resources.len() as u64, Ordering::Relaxed);
+        RETIRED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((STARTED.load(Ordering::Acquire), Retired(Box::new(resources))));
+    }
+    const BATCH: usize = 256;
+    thread_local! {
+        static HELD: std::cell::RefCell<Batch> = const { std::cell::RefCell::new(Batch(Vec::new())) };
+    }
+    let full = HELD.with_borrow_mut(|held| {
+        held.0.push(resource);
+        (held.0.len() >= BATCH).then(|| std::mem::take(&mut held.0))
+    });
+    if let Some(full) = full {
+        hand_over(full);
+    }
 }
 
 /// Drops what waited for submissions up to `finished`.
@@ -782,7 +836,7 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
-    twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    twins: Mutex<crate::fast::FastMap<usize, TwinUse>>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -794,6 +848,9 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// What argument blocks are clamped into, and the bytes given of it
+    /// ([`HostList::indirect_arena`]).
+    indirect_arena: Mutex<Option<(ID3D12Resource, u64)>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -828,7 +885,7 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
-type States = std::collections::HashMap<
+type States = crate::fast::FastMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
@@ -2136,9 +2193,12 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    refreshed: crate::fast::FastSet<(usize, usize, usize)>,
+    /// Copies in place the list holds until it is reset (nothing to bring
+    /// up to date), by address.
+    held: crate::fast::FastMap<usize, std::sync::Arc<crate::shadow::Shadow>>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: crate::fast::FastSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2147,6 +2207,11 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    /// Title textures of the kinds copied back ([`crate::texback`]) that
+    /// the list's shaders write, copied when the list closes.
+    back_wanted: Vec<usize>,
+    /// Those copies, whose texels go to title memory once the list has run.
+    texture_backs: Vec<crate::texback::Back>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -3301,6 +3366,10 @@ pub(crate) fn walls_trace() -> bool {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    // Textures shaders wrote that the title reads on the CPU.
+    for back in &list.deferred().texture_backs {
+        crate::texback::land(back);
+    }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -3581,6 +3650,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                indirect_arena: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -4932,7 +5002,11 @@ impl Host {
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
-        if !late {
+        #[cfg(feature = "diagnostics")]
+        let wait_first = crate::capture::knob("sync");
+        #[cfg(not(feature = "diagnostics"))]
+        let wait_first = false;
+        if !late || wait_first {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
             if relay_exact() && why == WHY_READ {
@@ -5475,6 +5549,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.textures_back();
         self.twins_to_depth();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -5536,9 +5611,19 @@ impl HostList {
         resource: crate::object::This,
         wanted: u32,
     ) -> Option<(&'static ID3D12Resource, u32)> {
-        let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
-        let wanted = legal_state(texture, wanted);
+        self.transition_of(copy, wanted)
+    }
+
+    /// [`HostList::transition`] of a host copy already at hand.
+    pub(crate) fn transition_of(
+        &self,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<(&'static ID3D12Resource, u32)> {
+        // SAFETY: the list holds the copy from here on, until it is reset.
+        let texture: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&copy.texture) };
+        let wanted = legal_for(copy.flags, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -5557,7 +5642,7 @@ impl HostList {
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
     fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
-        let wanted = legal_state(&copy.texture, wanted);
+        let wanted = legal_for(copy.flags, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -5901,7 +5986,10 @@ impl HostList {
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
-                && deferred.backs.is_empty())
+                && deferred.backs.is_empty()
+                && deferred.back_wanted.is_empty()
+                && deferred.texture_backs.is_empty()
+                && deferred.held.is_empty())
             {
                 return false;
             }
@@ -5968,6 +6056,44 @@ impl HostList {
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
         }
+    }
+
+    /// A draw or dispatch being prepared writes title texture `resource`
+    /// through unordered access: if it is of a kind copied back
+    /// ([`crate::texback`]), the list copies it when it closes.
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource) {
+            return;
+        }
+        let mut deferred = self.deferred();
+        if !deferred.back_wanted.contains(&(resource as usize)) {
+            deferred.back_wanted.push(resource as usize);
+        }
+    }
+
+    /// Before the list closes: the textures its shaders wrote that are copied
+    /// back go into read-back buffers ([`crate::texback::record`]).
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        for resource in wanted {
+            let resource = resource as crate::object::This;
+            let Some(copy) = crate::resource::host_copy(resource) else {
+                continue;
+            };
+            crate::list::ensure_state(self, resource, COPY_SOURCE);
+            if let Some(back) = crate::texback::record(&self.list, resource, &copy.texture) {
+                self.deferred().texture_backs.push(back);
+            }
+        }
+    }
+
+    /// Holds a copy in place until the list is reset.
+    pub(crate) fn hold_in_place(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
+        self.deferred()
+            .held
+            .entry(std::sync::Arc::as_ptr(shadow) as usize)
+            .or_insert_with(|| shadow.clone());
     }
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
@@ -6111,6 +6237,31 @@ impl HostList {
             self.keep(&old_buf);
         }
         Some(buffer)
+    }
+
+    /// Room for `size` bytes of clamped indirect arguments, the list's own
+    /// until it is reset: the buffer, the offset in it, and whether the list
+    /// has used the buffer before (it is then in the argument state). `None`
+    /// when the arena is full.
+    pub(crate) fn indirect_arena(&self, size: u64) -> Option<(ID3D12Resource, u64, bool)> {
+        const ARENA: u64 = 1 << 20;
+        let mut slot = self.indirect_arena.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            let buffer = host()?.uav_buffer(ARENA)?;
+            name(&buffer, || "indirect arguments, by the block".to_owned());
+            *slot = Some((buffer, 0));
+        }
+        let first = self.first_use(usize::MAX - 0x79);
+        let (buffer, used) = slot.as_mut()?;
+        if first {
+            *used = 0;
+        }
+        let at = *used;
+        if at + size > ARENA {
+            return None;
+        }
+        *used += size;
+        Some((buffer.clone(), at, at > 0))
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -6262,9 +6413,9 @@ struct Batch {
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
     /// comparisons a frame.
-    index: std::collections::HashMap<usize, usize>,
+    index: crate::fast::FastMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
-    textures: std::collections::HashSet<usize>,
+    textures: crate::fast::FastSet<usize>,
 }
 
 impl Batch {
@@ -7440,6 +7591,34 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .fold(state, |s, &(_, _, bits)| s & !bits)
 }
 
+/// The most of the card's memory taken for a budget on a host whose card
+/// uses the PC's memory, in bytes: `VICTORY_CARD_MB`, else under Wine on
+/// macOS a third of the PC's memory. D3DMetal gives three quarters of it
+/// for a budget and the texture queue filled nine tenths of that: 22 GB of
+/// a 24 GB Mac with the title's own memory beside it, so the system
+/// compressed and unpacked 1.8 GB a second and every look at title memory
+/// waited for it.
+fn shared_memory_budget() -> Option<u64> {
+    static MOST: OnceLock<Option<u64>> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        if let Some(mb) = std::env::var("VICTORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+            return (mb > 0).then_some(mb << 20);
+        }
+        if wine_host().as_deref() != Some("Darwin") {
+            return None;
+        }
+        // SAFETY: plain data filled in by the call, its size set.
+        let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        status.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: as above.
+        let known = unsafe { GlobalMemoryStatusEx(&mut status) } != 0;
+        let most = known.then_some(status.ullTotalPhys / 3);
+        tracing::info!(total_mb = status.ullTotalPhys >> 20, budget_mb = ?most.map(|m| m >> 20), "the card uses the PC's memory");
+        most
+    })
+}
+
 impl Host {
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
@@ -7457,6 +7636,17 @@ impl Host {
             adapter
                 .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut shared)
                 .ok()?;
+        }
+        // Where the card's memory is the PC's (Apple's): what the title and
+        // the rest of the system need is not the card's to fill.
+        if let Some(most) = shared_memory_budget() {
+            own.Budget = own.Budget.min(most);
+            shared.Budget = shared.Budget.min(most);
+            // Title memory in place is counted as the card's, but is the
+            // title's: no room of the card's goes to it.
+            let placed = crate::inplace::bytes();
+            own.CurrentUsage = own.CurrentUsage.saturating_sub(placed);
+            shared.CurrentUsage = shared.CurrentUsage.saturating_sub(placed);
         }
         // The card's budget moved by 256 MB or more since the last look:
         // said at once, with what was in use at the last look, so the log

@@ -137,6 +137,30 @@ static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u
 /// after the frame it was found at. The file is removed.
 static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
+/// Switches read while the title runs (`VICTORY_KNOBS`: a file of
+/// `name` words, looked at every 100 ms), so one run can tell several
+/// suspects apart.
+pub(crate) fn knob(name: &str) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static FILE: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
+    static WORDS: Mutex<(u64, Vec<String>)> = Mutex::new((0, Vec::new()));
+    let Some(file) = FILE.get_or_init(|| std::env::var_os("VICTORY_KNOBS")) else {
+        return false;
+    };
+    let now = crate::host::now_ms();
+    let mut words = WORDS.lock().unwrap_or_else(|e| e.into_inner());
+    if now >= words.0 + 100 {
+        let new: Vec<String> = std::fs::read_to_string(file)
+            .map(|t| t.split_whitespace().map(str::to_owned).collect())
+            .unwrap_or_default();
+        if new != words.1 {
+            tracing::info!(?new, "knobs");
+        }
+        *words = (now, new);
+    }
+    words.1.iter().any(|w| w == name)
+}
+
 /// At the present of `frame`: the draws run on the host so far.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;

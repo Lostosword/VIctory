@@ -139,10 +139,69 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.shaders.is_empty() {
+        return;
+    }
+    DECLARED.fetch_add(1, Ordering::Relaxed);
+    if super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
+    } else if preparing() {
+        prepare_later(p);
     }
+}
+
+/// The pipelines the title has declared so far.
+pub(crate) static DECLARED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether every pipeline the title declares is compiled, not only those a
+/// run has drawn with (`VICTORY_PREPARE=1`; for a run left at the menu).
+fn preparing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PREPARE").is_some_and(|v| v == "1"))
+}
+
+/// Pipelines still to be prepared. Compiled when nothing else is to be
+/// made, and let go at once: what stays is the translations and what the
+/// host's compiler keeps on disk.
+fn prepare_later(p: &Arc<Pending>) {
+    static SPARE: Mutex<VecDeque<Arc<Pending>>> = Mutex::new(VecDeque::new());
+    static ADDED: AtomicU64 = AtomicU64::new(0);
+    static DONE: AtomicU64 = AtomicU64::new(0);
+    static WORKERS: std::sync::Once = std::sync::Once::new();
+    SPARE.lock().unwrap_or_else(|e| e.into_inner()).push_back(p.clone());
+    ADDED.fetch_add(1, Ordering::Relaxed);
+    WORKERS.call_once(|| {
+        let threads = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(1, 6));
+        for i in 0..threads {
+            let _ = std::thread::Builder::new().name(format!("victory-prepare-{i}")).spawn(|| {
+                // SAFETY: a plain call on our own thread.
+                unsafe {
+                    use windows::Win32::System::Threading::*;
+                    let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+                }
+                loop {
+                    // Behind everything the title waits for.
+                    while WAITING.load(Ordering::Relaxed) > 0 {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    let next = SPARE.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+                    let Some(p) = next else {
+                        std::thread::sleep(Duration::from_millis(200));
+                        continue;
+                    };
+                    if p.queue_state.load(Ordering::Relaxed) == NOT_QUEUED && !super::library::prepared(&p.key) {
+                        drop(HostPipeline::new(&p.shaders, p.graphics.as_deref()));
+                        super::library::note_prepared(&p.key);
+                    }
+                    let done = DONE.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done.is_multiple_of(100) || done == ADDED.load(Ordering::Relaxed) {
+                        tracing::info!(done, of = ADDED.load(Ordering::Relaxed), declared = DECLARED.load(Ordering::Relaxed), "pipelines prepared");
+                    }
+                }
+            });
+        }
+    });
 }
 
 /// Whether the frame's budget is one for all threads together: a thread

@@ -583,6 +583,8 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    #[cfg(feature = "diagnostics")]
+    crate::span::span!("texture::upload");
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -932,7 +934,10 @@ impl Staging {
         // hashed all of them again.
         if !crate::watch::tracking() {
             let frame = crate::frame::current();
-            if last.looked == Some(frame) {
+            let same = last.looked == Some(frame);
+            #[cfg(feature = "diagnostics")]
+            let same = same && !crate::capture::knob("textures");
+            if same {
                 return 0;
             }
             last.looked = Some(frame);

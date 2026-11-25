@@ -107,7 +107,8 @@ static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
     pub(crate) buffer: ID3D12Resource,
-    pub(crate) heap: ID3D12Heap,
+    /// (None where the buffer itself was made on the memory: [`on_memory`])
+    pub(crate) heap: Option<ID3D12Heap>,
     /// The host GPU address of the title memory's first byte.
     pub(crate) gpu: u64,
     /// Bytes from the buffer's first byte to the title memory's first.
@@ -121,6 +122,17 @@ pub(crate) struct Placed {
 pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
     let at = start & !(K64 as u64 - 1);
     let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
+    if let Some(mail) = mail() {
+        let (from, to) = (at as usize, (at + bytes) as usize);
+        let views = level() >= 3 && matches!(crate::mapped::hold(from, to), crate::mapped::Hold::Mapped(_));
+        if !views && !private_whole(from, bytes as usize) {
+            return Err(None);
+        }
+        let buffer = on_memory(device, mail, at, bytes).map_err(Some)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+        return Ok(Placed { buffer, heap: None, gpu, bias: start - at });
+    }
     if !private_whole(at as usize, bytes as usize) {
         return Err(None);
     }
@@ -128,7 +140,103 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, gpu, bias: start - at })
+    Ok(Placed { buffer, heap: Some(heap), gpu, bias: start - at })
+}
+
+/// How a library inserted into Wine on macOS (`tools/macos/nocopy.m`) is
+/// asked for a buffer on memory that is there.
+#[repr(C)]
+struct Mail {
+    magic: u64,
+    process: u32,
+    /// 1 asked, 2 made, 3 refused.
+    state: std::sync::atomic::AtomicU32,
+    address: AtomicU64,
+    length: AtomicU64,
+    asked: AtomicU64,
+}
+
+/// What [`on_memory`] asks for beyond the memory's bytes: no other buffer
+/// made meanwhile has such a length.
+const MARK: u64 = 0x1230;
+
+/// The inserted library's mailbox, if it is there and a buffer made on
+/// memory of our own leaves the memory as it was.
+fn mail() -> Option<&'static Mail> {
+    static MAIL: std::sync::OnceLock<Option<&'static Mail>> = std::sync::OnceLock::new();
+    *MAIL.get_or_init(|| {
+        let at = usize::from_str_radix(std::env::var("VICTORY_NOCOPY").ok()?.trim(), 16).ok()?;
+        let mut magic = [0u8; 8];
+        if at == 0 || !crate::host::read_into(at as *const u8, &mut magic) || &magic != b"VINOCOPY" {
+            tracing::warn!("VICTORY_NOCOPY names no mailbox of this process");
+            return None;
+        }
+        // SAFETY: the mailbox is a static of a library that stays loaded.
+        let mail = unsafe { &*(at as *const Mail) };
+        let device = &crate::host::host()?.device;
+        // SAFETY: plain allocation; kept for the process's life.
+        let own = unsafe { mem::VirtualAlloc(std::ptr::null(), 16 * K64, mem::MEM_COMMIT | mem::MEM_RESERVE, mem::PAGE_READWRITE) };
+        if own.is_null() {
+            return None;
+        }
+        // SAFETY: our own memory, of that size.
+        let words = unsafe { std::slice::from_raw_parts_mut(own.cast::<u32>(), 16 * K64 / 4) };
+        words.iter_mut().enumerate().for_each(|(i, w)| *w = i as u32 ^ 0x5a5a_5a5a);
+        let made = on_memory(device, mail, own as u64, 16 * K64 as u64);
+        let kept = words.iter().enumerate().all(|(i, &w)| w == i as u32 ^ 0x5a5a_5a5a);
+        match made {
+            Ok(_) if kept => {
+                tracing::info!("title memory may be the card's own (the inserted library makes buffers on it)");
+                Some(mail)
+            }
+            made => {
+                tracing::warn!(error = ?made.err(), kept, "buffers on memory that is there do not work");
+                None
+            }
+        }
+    })
+}
+
+/// A buffer whose memory is `[at, at + bytes)` (both multiples of 64 KiB,
+/// mapped read-write), by the inserted library.
+fn on_memory(device: &ID3D12Device, mail: &Mail, at: u64, bytes: u64) -> windows::core::Result<ID3D12Resource> {
+    static ONE: Mutex<()> = Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    mail.address.store(at, Ordering::Relaxed);
+    mail.length.store(bytes, Ordering::Relaxed);
+    mail.asked.store(bytes + MARK, Ordering::Relaxed);
+    mail.state.store(1, Ordering::Release);
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_CUSTOM,
+        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+        MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+        ..Default::default()
+    };
+    let mut made: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation.
+    let result = unsafe {
+        device.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_CREATE_NOT_ZEROED,
+            &buffer_desc(bytes + MARK, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut made,
+        )
+    };
+    let state = mail.state.swap(0, Ordering::AcqRel);
+    result?;
+    let made = made.ok_or_else(windows::core::Error::empty)?;
+    let mut data = std::ptr::null_mut();
+    // SAFETY: a CPU-visible buffer.
+    unsafe { made.Map(0, None, Some(&mut data))? };
+    if state != 2 || data as u64 != at {
+        return Err(windows::core::Error::new(
+            windows::core::HRESULT(0x8000_4005_u32 as i32),
+            format!("not made on the memory (state {state}, mapped at {data:p}, asked for {at:#x})"),
+        ));
+    }
+    Ok(made)
 }
 
 /// Title memory `[start, start + len)` in place, for a window outside
@@ -139,7 +247,7 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         return None;
     }
     // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
+    if cover(start as usize, len as usize) != Cover::None && !(level() >= 3 && mail().is_some()) {
         STATS[4].fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -166,6 +274,12 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             None
         }
     }
+}
+
+/// The bytes of title memory in place now. The system counts them as
+/// the card's, though they take no memory beyond the title's own.
+pub(crate) fn bytes() -> u64 {
+    STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed)
 }
 
 /// What [`place_for`] gave is gone.

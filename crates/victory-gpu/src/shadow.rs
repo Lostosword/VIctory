@@ -71,12 +71,14 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// In place on the part of its 4 MiB cell that has memory ([`part_of`]).
+    part: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
-    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    place: Option<(Option<windows::Win32::Graphics::Direct3D12::ID3D12Heap>, u64)>,
     /// Where nothing is write-tracked: per 64 KiB block of title memory from
     /// `start`'s on, the frame it was last looked at in and how many looks in
     /// a row found it as it was ([`Shadow::copy_untracked`]).
@@ -160,6 +162,20 @@ struct Card {
 pub(crate) fn cards() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
+}
+
+/// Whether shaders read the title's constants where they are, at any
+/// address: the host asks for addresses on 256 bytes and the console for 16,
+/// so they were copied for each list, 12,000 times a frame. D3DMetal reads
+/// right at any of them (`examples/cbvplace.rs`). On under Wine on macOS;
+/// `VICTORY_CONSTANTS_IN_PLACE=0` copies them, `=1` never does.
+pub(crate) fn constants_in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_CONSTANTS_IN_PLACE").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => crate::host::wine_host().as_deref() == Some("Darwin"),
+    })
 }
 
 /// The smallest title buffer whose copy goes to the card's memory, and the
@@ -2162,7 +2178,12 @@ pub(crate) fn let_go_idle() {
             })
             .map(|(key, _)| *key)
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        let gone: Vec<Arc<Shadow>> = idle.into_iter().filter_map(|key| map.remove(&key)).collect();
+        // (under the lock: a thread that remembers one asks anew after this)
+        if !gone.is_empty() {
+            tables_changed();
+        }
+        gone
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -2247,6 +2268,11 @@ impl Shadow {
         self.id
     }
 
+    /// Whether it is no copy: the title's own memory (`crate::inplace`).
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
@@ -2272,6 +2298,11 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        // In place there is nothing to bring up to date.
+        if self.place.is_some() {
+            list.hold_in_place(self);
+            return;
+        }
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
     }
@@ -2302,6 +2333,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            part: false,
             place: None,
         }
     }
@@ -2328,7 +2360,9 @@ impl Shadow {
         // shortcut: another host copy of the same bytes (a title buffer
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
-        if self.place.is_some() {
+        // With submissions sent ahead the range is declared all the same: a
+        // later submission that reads it (a copy, a texture) waits for it.
+        if self.place.is_some() && !crate::host::late() {
             return;
         }
         let len = len.min(self.left(address));
@@ -2994,7 +3028,11 @@ impl Shadow {
         let start = self.start as usize;
         let frame = crate::frame::current() as u32 & 0xff_ffff;
         let looks = stable_looks();
+        #[cfg(feature = "diagnostics")]
+        let looks = if crate::capture::knob("looks") { 255 } else { looks };
         UNTRACKED[0].fetch_add((to - from) as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let compared = UNTRACKED[2].load(Ordering::Relaxed);
         let (base, first, last) = (start / PAGE, from.div_ceil(PAGE), to / PAGE);
         if first >= last {
             return self.copy(from, to);
@@ -3102,6 +3140,39 @@ impl Shadow {
             })
             .collect();
         wide(jobs);
+        #[cfg(feature = "diagnostics")]
+        {
+            static TOP: Mutex<Option<std::collections::HashMap<(u64, u64, bool), [u64; 2]>>> = Mutex::new(None);
+            static LAST: AtomicU64 = AtomicU64::new(0);
+            let mut top = TOP.lock().unwrap_or_else(|e| e.into_inner());
+            let top = top.get_or_insert_with(Default::default);
+            let e = top.entry((self.start, self.len, self.window)).or_default();
+            e[0] += UNTRACKED[2].load(Ordering::Relaxed).saturating_sub(compared);
+            e[1] += 1;
+            let now = crate::host::now_ms();
+            if now > LAST.load(Ordering::Relaxed) + 10_000 {
+                LAST.store(now, Ordering::Relaxed);
+                let mut all: Vec<_> = top.drain().collect();
+                all.sort_by_key(|(_, v)| std::cmp::Reverse(v[0]));
+                let total: u64 = all.iter().map(|(_, v)| v[0]).sum();
+                let lines: Vec<String> = all
+                    .iter()
+                    .take(12)
+                    .map(|((start, len, window), v)| {
+                        let page = *start as usize & !(PAGE - 1);
+                        format!(
+                            "{start:#x}+{:.1} MB window={window} {} MB x{} cover {:?} whole {}",
+                            *len as f64 / 1048576.0,
+                            v[0] >> 20,
+                            v[1],
+                            crate::inplace::cover(*start as usize, *len as usize),
+                            crate::inplace::private_whole(page, *len as usize),
+                        )
+                    })
+                    .collect();
+                tracing::info!("compared since the last line: {} MB by {} copies: {}", total >> 20, all.len(), lines.join("; "));
+            }
+        }
         let mut changed = std::mem::take(&mut *changed.lock().unwrap_or_else(|e| e.into_inner()));
         changed.sort_unstable();
         let mut bytes = 0;
@@ -3480,11 +3551,13 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    tables_changed();
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().remove(&(start, resource));
+    tables_changed();
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -3509,8 +3582,12 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     {
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
         let keys: Vec<(u64, u64)> = map
-            .range((at.saturating_sub(WINDOW), 0)..(end, 0))
-            .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
+            .range((at.saturating_sub(WINDOW), 0)..(end.saturating_add(WINDOW), 0))
+            .filter(|(key, shadow)| {
+                // (a part goes when anything of its cell changes: it may reach further then)
+                let (start, stop) = if shadow.part { (key.0 & !(WINDOW - 1), (key.0 | (WINDOW - 1)) + 1) } else { (key.0, key.0 + key.1) };
+                shadow.place.is_some() && start < end && stop > at
+            })
             .map(|(key, _)| *key)
             .collect();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
@@ -3525,6 +3602,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         }
     }
     let n = gone.len() as u64;
+    if n > 0 {
+        tables_changed();
+    }
     for shadow in gone {
         crate::host::retire(shadow);
     }
@@ -3545,6 +3625,8 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    #[cfg(feature = "diagnostics")]
+    crate::span::span!("shadow::find");
     lookup(address, len, false)
 }
 
@@ -3573,7 +3655,64 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, true)
 }
 
+/// Counts the changes after which an ask may have another answer than
+/// before: a buffer made or released, a copy taken out of the tables.
+static TURN: AtomicU64 = AtomicU64::new(1);
+
+/// The tables changed: what threads remember of them is asked anew.
+fn tables_changed() {
+    TURN.fetch_add(1, Ordering::Release);
+}
+
+/// An answer of [`lookup`] a thread remembers. Not holding the copy: what
+/// the tables let go of goes.
+struct Remembered {
+    turn: u64,
+    address: u64,
+    len: u64,
+    any: bool,
+    shadow: std::sync::Weak<Shadow>,
+}
+
+/// Answers a thread remembers (a power of two).
+const REMEMBERED: usize = 1 << 13;
+
+/// The copy that holds `[address, address + len)`. A frame asks 230,000
+/// times, on five threads, and the tables have one lock: each thread
+/// remembers its last answers.
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    thread_local! {
+        static ANSWERS: std::cell::RefCell<Vec<Option<Remembered>>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let turn = TURN.load(Ordering::Acquire);
+    let place = {
+        let mixed = (address ^ len.rotate_left(40) ^ u64::from(any)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        (mixed >> 51) as usize & (REMEMBERED - 1)
+    };
+    let known = ANSWERS.with_borrow(|answers| {
+        let a = answers.get(place)?.as_ref()?;
+        if a.turn != turn || a.address != address || a.len != len || a.any != any {
+            return None;
+        }
+        a.shadow.upgrade()
+    });
+    if let Some(shadow) = known {
+        if shadow.window {
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        }
+        return Some(shadow);
+    }
+    let found = lookup_tables(address, len, any)?;
+    ANSWERS.with_borrow_mut(|answers| {
+        if answers.is_empty() {
+            answers.resize_with(REMEMBERED, || None);
+        }
+        answers[place] = Some(Remembered { turn, address, len, any, shadow: Arc::downgrade(&found) });
+    });
+    Some(found)
+}
+
+fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -3785,6 +3924,29 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// Whether a 4 MiB cell of title memory that is not mapped whole is in
+/// place by the part an ask without a length lies in
+/// (`VICTORY_INPLACE_PARTS=0`: a copy of the whole cell). Such a copy has
+/// nothing that says what changed in it: 335 of them were compared with
+/// title memory every frame, 570 MB.
+fn parts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        crate::inplace::level() >= 3 && !tails() && std::env::var_os("VICTORY_INPLACE_PARTS").is_none_or(|v| v != "0")
+    })
+}
+
+/// The run of mapped title memory that holds `[address, end)`, within the
+/// ask's 4 MiB cell (start, bytes): `None` if nothing is known of it.
+fn part_of(address: u64, end: u64) -> Option<(u64, u64)> {
+    let cell = address & !(WINDOW - 1);
+    let (from, to, _) = crate::mapped::pieces(cell as usize, (cell + WINDOW) as usize)
+        .into_iter()
+        .find(|&(from, to, state)| state == crate::mapped::State::Mapped && from as u64 <= address && to as u64 >= end)?;
+    let (from, to) = ((from as u64).next_multiple_of(PAGE as u64), to as u64 & !(PAGE as u64 - 1));
+    (from <= address && to >= end).then_some((from, to - from))
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let (cell, _) = window_of(address, end, WINDOW);
@@ -3810,6 +3972,33 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
     };
+    if unsized_ask && parts() {
+        let there = map.range((cell, 0)..=(address, u64::MAX)).rev().map(|(_, shadow)| shadow);
+        if let Some(shadow) = there.into_iter().find(|s| s.part && s.start + s.len >= end) {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+    }
+    if let Some(shadow) = map.get(&(start, len))
+        && (!unsized_ask || shadow.place.is_some() || !parts())
+    {
+        note(shadow);
+        return Some(shadow.clone());
+    }
+    // A cell with holes: in place on the part of it the ask lies in. What
+    // the shader reads past it is nothing the console has either.
+    if unsized_ask
+        && parts()
+        && let Some((from, bytes)) = part_of(address, end)
+        && let Some(placed) = crate::inplace::place_for(from, bytes, true)
+    {
+        let mut shadow = Shadow::placed(placed, from, bytes, true);
+        shadow.part = bytes < WINDOW;
+        let shadow = Arc::new(shadow);
+        note(&shadow);
+        map.insert((from, bytes), shadow.clone());
+        return Some(shadow);
+    }
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
         return Some(shadow.clone());

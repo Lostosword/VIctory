@@ -186,9 +186,117 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// Whether argument buffers are clamped a block at a time
+/// ([`crate::indirect::bound_block`]): `VICTORY_INDIRECT_BLOCKS=1`, off by
+/// default (draws go missing, not understood yet). Of a listed frame's
+/// 3,784 indirect draws 179 then need a pass of ours, where before 3,693
+/// did, each of them ending a render pass: the title's 96 passes were some
+/// 1,300 on the card.
+///
+/// A block stays clamped until the list's next dispatch, direct or
+/// indirect. A draw whose shaders store to buffers does not end it, as it
+/// ends a window ([`windows`]): nothing the title draws writes arguments.
+fn blocks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_INDIRECT_BLOCKS").as_deref() {
+        Ok("1") => true,
+        _ => false,
+    })
+}
+
+/// `VICTORY_BLOCK_TEST` (an experiment): 1 waits for every earlier shader
+/// write before each draw from a block, as the clamp of each did.
+fn block_test() -> u8 {
+    static BITS: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| std::env::var("VICTORY_BLOCK_TEST").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// `VICTORY_BLOCK_TEST=4` (an experiment): the draws are clamped one by one
+/// as before, and the record a block gave is compared with each.
+fn block_compare(
+    list: &HostList,
+    (arena, at): (&ID3D12Resource, u64),
+    alone: &ID3D12Resource,
+    what: (u32, u64, u64, bool),
+) {
+    use std::sync::Mutex;
+    const N: usize = 16384;
+    type Note = Option<(u64, (u32, u64, u64, bool))>;
+    static STATE: Mutex<(usize, Vec<Note>)> = Mutex::new((0, Vec::new()));
+    static BUFFER: std::sync::OnceLock<Option<(ID3D12Resource, usize)>> = std::sync::OnceLock::new();
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    let Some((buffer, data)) =
+        BUFFER.get_or_init(|| crate::host::host()?.shared_buffer(N as u64 * 32).map(|(b, d)| (b, d as usize)))
+    else {
+        return;
+    };
+    let frame = u64::from(crate::frame::current() as u32);
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if state.1.is_empty() {
+        state.1 = vec![None; N];
+    }
+    let i = state.0 % N;
+    state.0 += 1;
+    // What the slot held is old enough to have run.
+    if let Some((then, (kind, address, offset, indexed))) = state.1[i]
+        && then + 3 <= frame
+    {
+        // SAFETY: inside the buffer's mapping.
+        let w: [u32; 8] = unsafe { ((*data + i * 32) as *const [u32; 8]).read_volatile() };
+        static SEEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+        let same = w[..3] == w[4..7];
+        let all = SEEN[usize::from(!same)].fetch_add(1, Ordering::Relaxed) + 1;
+        if !same && SAID.fetch_add(1, Ordering::Relaxed) < 60 {
+            tracing::info!(kind, address = format_args!("{address:#x}"), offset = format_args!("{offset:#x}"), indexed,
+                block = ?&w[..4], alone = ?&w[4..], differing = all, same = SEEN[0].load(Ordering::Relaxed), slot = i, "BLOCK differs");
+        }
+        if all.is_multiple_of(20000) {
+            tracing::info!(same = SEEN[0].load(Ordering::Relaxed), differing = SEEN[1].load(Ordering::Relaxed), "BLOCK compared");
+        }
+    } else if state.1[i].is_some() {
+        return;
+    }
+    state.1[i] = Some((frame, what));
+    drop(state);
+    let (args, source, common, dest) = (
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    );
+    use crate::host::transition;
+    // SAFETY: an open list and live buffers.
+    unsafe {
+        list.list.ResourceBarrier(&[transition(arena, args, source), transition(alone, args, source), transition(buffer, common, dest)]);
+        list.list.CopyBufferRegion(buffer, i as u64 * 32, arena, at, 16);
+        list.list.CopyBufferRegion(buffer, i as u64 * 32 + 16, alone, 0, 16);
+        list.list.ResourceBarrier(&[transition(arena, source, args), transition(alone, source, args), transition(buffer, dest, common)]);
+    }
+}
+
+/// A block of an argument buffer clamped by the list: the copy it came
+/// from, the kind of its records and whether they left as indexed draws,
+/// the block's offset in the copy, and the first record's past its start.
+type BlockKey = (u64, u32, bool, u64, u64);
+
+/// Where a block's records are: the arena, their offset in it, the offset
+/// of the first in the copy, how many.
+#[derive(Clone)]
+struct Block {
+    arena: ID3D12Resource,
+    at: u64,
+    first: u64,
+    records: u64,
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    /// The argument blocks the list has clamped ([`blocks`]).
+    clamped: crate::fast::FastMap<BlockKey, Block>,
+    /// Another pass may have begun since the last wait for what the clamps
+    /// wrote ([`State::pass_may_begin`]).
+    arguments_stale: bool,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -226,7 +334,7 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    fresh_tables: crate::fast::FastMap<(u64, u32, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -234,9 +342,9 @@ pub(crate) struct State {
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
-    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_srv_slots: crate::fast::FastMap<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
-    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_uav_slots: crate::fast::FastMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
 }
@@ -512,6 +620,8 @@ pub(crate) fn geometry_target() -> Option<This> {
 /// megabyte was never brought up to date - meshes without bodies, exploded
 /// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
+    #[cfg(feature = "diagnostics")]
+    crate::span::span!("root_view");
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         std::env::var("VICTORY_ROOT_VIEW_MB")
@@ -524,7 +634,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
     let gpu = shadow.gpu(address);
-    if srv || gpu % 256 == 0 {
+    if srv || gpu % 256 == 0 || (shadow.in_place() && crate::shadow::constants_in_place()) {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
@@ -639,6 +749,9 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        #[cfg(feature = "diagnostics")]
+        crate::span::span!("set_targets");
+        self.pass_may_begin();
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -868,6 +981,8 @@ impl State {
     /// ([`crate::memory`]): its directory, fault notes and view slots,
     /// with the pages of the root views the list has set made ready.
     fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
+        #[cfg(feature = "diagnostics")]
+        crate::span::span!("memory_ready");
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
@@ -922,6 +1037,8 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        crate::span::span!("prepare");
         if crate::pipeline::is_skipped(self.pipeline as This) || self.beside_geometry() {
             return false;
         }
@@ -1016,6 +1133,8 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        crate::span::span!("bind");
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -1249,6 +1368,8 @@ impl State {
         compute: bool,
         writes: bool,
     ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        crate::span::span!("root_uav");
         const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
         static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let limit = *LIMIT.get_or_init(|| {
@@ -1360,6 +1481,8 @@ impl State {
         compute: bool,
         biased: bool,
     ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        crate::span::span!("root_srv_table");
         let heap = match self.heaps[0] {
             0 => None,
             h => Some(crate::descriptor::heap(h as This)),
@@ -1441,6 +1564,8 @@ impl State {
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
+        #[cfg(feature = "diagnostics")]
+        crate::span::span!("heap_buffers");
         let heap = self
             .heaps
             .iter()
@@ -1465,7 +1590,10 @@ impl State {
         // of one frame is seen a frame late.
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         let frame = crate::frame::current();
-        if FRAME.swap(frame, Ordering::Relaxed) == frame {
+        let again = FRAME.swap(frame, Ordering::Relaxed) == frame;
+        #[cfg(feature = "diagnostics")]
+        let again = again && !crate::capture::knob("heap");
+        if again {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
@@ -1565,8 +1693,10 @@ impl State {
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(1)
                 });
+                #[cfg(feature = "diagnostics")]
+                let every = if crate::capture::knob("heap") { 0 } else { every };
                 match whole.get(&key) {
-                    Some(&last) if frame < last + every => continue,
+                    Some(&last) if frame < last.wrapping_add(every) => continue,
                     _ => {
                         whole.insert(key, frame);
                     }
@@ -1604,6 +1734,8 @@ impl State {
     /// title's bake programs. The uploads are recorded into `list` ahead
     /// of the draw being bound, as the world's pass records them.
     fn early_textures(&self, list: &HostList, p: &HostPipeline, compute: bool) {
+        #[cfg(feature = "diagnostics")]
+        crate::span::span!("early_textures");
         let (early_ms, bake_ms) = early_budgets();
         if compute || (early_ms == 0 && bake_ms == 0) {
             return;
@@ -1757,6 +1889,8 @@ impl State {
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
     ) {
+        #[cfg(feature = "diagnostics")]
+        crate::span::span!("heap_textures");
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
@@ -2141,10 +2275,87 @@ impl State {
         });
     }
 
+    /// Something was recorded that may end the pass the host draws in: the
+    /// next draw from a clamped block waits for the clamps anew. D3DMetal
+    /// has a wait hold for the encoder that comes next; draws of a later
+    /// pass read the arguments of a block before its clamp had run.
+    pub(crate) fn pass_may_begin(&mut self) {
+        self.arguments_stale = true;
+    }
+
+    /// The record at `offset` of `args` (title address `arguments`) clamped
+    /// with its block ([`blocks`]): the buffer it is in and its offset there.
+    fn clamped_block(
+        &mut self,
+        list: &HostList,
+        args: &std::sync::Arc<crate::shadow::Shadow>,
+        (offset, arguments): (u64, u64),
+        kind: u32,
+        indexed: bool,
+    ) -> Option<(ID3D12Resource, u64)> {
+        #[cfg(feature = "diagnostics")]
+        crate::span::span!("clamped_block");
+        use crate::indirect::{BLOCK, INDEXED_RECORD, block_step};
+        if list.first_use(usize::MAX - 0x7b) {
+            self.clamped.clear();
+        }
+        let step = block_step(kind);
+        // The record's own bytes: a draw's, an indexed one's, a mesh
+        // dispatch's.
+        let bytes = match kind {
+            0 => 16,
+            1 => 20,
+            _ => 12,
+        };
+        let block = offset / BLOCK * BLOCK;
+        let phase = offset % step;
+        let key = (args.id(), kind, indexed, block, phase);
+        let find = |b: &Block| {
+            let n = (offset - b.first) / step;
+            let spacing = if indexed { u64::from(INDEXED_RECORD) } else { step };
+            (n < b.records).then(|| (b.arena.clone(), b.at + n * spacing))
+        };
+        if block_test() & 2 != 0 {
+            self.clamped.clear();
+        }
+        if let Some(b) = self.clamped.get(&key) {
+            let found = find(b);
+            if found.is_some() && (self.arguments_stale || block_test() & 8 != 0) {
+                crate::indirect::wait_for_block(list, &b.arena);
+                self.arguments_stale = false;
+            }
+            return found;
+        }
+        // The part of the block that lies in the copy.
+        let start = arguments - (offset - block).min(arguments - args.span().0);
+        let low = offset - (arguments - start);
+        let first = low + (phase + step - low % step) % step;
+        let end = (block + BLOCK).min(offset + args.left(arguments));
+        let records = (end.checked_sub(first)?.checked_sub(bytes)? + 1).div_ceil(step);
+        if first > offset || records == 0 {
+            return None;
+        }
+        // (whole steps are copied: the last record's must be in the copy)
+        let records = if first + records * step > offset + args.left(arguments) { records - 1 } else { records };
+        args.refresh(list, start, end - low);
+        let (arena, at) =
+            crate::indirect::bound_block(list, (&args.buffer, first), (kind, step as u32, records as u32), indexed)?;
+        self.host_pipeline = 0;
+        self.host_roots[1] = 0;
+        self.arguments_stale = false;
+        let made = Block { arena, at, first, records };
+        let found = find(&made);
+        self.clamped.insert(key, made);
+        found
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        #[cfg(feature = "diagnostics")]
+        crate::span::span!("dispatch");
         // It may write the arguments a window holds clamped.
         self.window = None;
+        self.clamped.clear();
         if crate::pipeline::is_skipped(self.pipeline as This) {
             #[cfg(feature = "diagnostics")]
             {
@@ -2476,6 +2687,8 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        #[cfg(feature = "diagnostics")]
+        crate::span::span!("dispatch_mesh");
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
@@ -2579,6 +2792,8 @@ impl State {
     }
 
     fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+        #[cfg(feature = "diagnostics")]
+        crate::span::span!("table_entry");
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -2616,6 +2831,8 @@ impl State {
         indexed: &[RootIndexedView],
         compute: bool,
     ) -> Vec<(u8, u32)> {
+        #[cfg(feature = "diagnostics")]
+        crate::span::span!("tables");
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -2703,7 +2920,7 @@ impl State {
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
+                let mut h = crate::fast::Fast::default();
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
@@ -2751,6 +2968,15 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // In place, where the title has them.
+                        if crate::shadow::constants_in_place()
+                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                            && shadow.in_place()
+                        {
+                            list.hold_in_place(&shadow);
+                            host.constant_at(index, shadow.gpu(address), size);
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -2759,7 +2985,7 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        host.make_record(index, table + u64::from(k) * 32, &view);
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
@@ -2867,6 +3093,8 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        #[cfg(feature = "diagnostics")]
+        crate::span::span!("draw");
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -2972,6 +3200,8 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        #[cfg(feature = "diagnostics")]
+        crate::span::span!("draw_indexed");
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
@@ -3014,6 +3244,8 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        crate::span::span!("execute_indirect");
         // Skip before the argument clamp can mutate the indirect buffer.
         if crate::pipeline::is_skipped(self.pipeline as This) || self.beside_geometry() {
             #[cfg(feature = "diagnostics")]
@@ -3134,7 +3366,25 @@ impl State {
                 };
                 (w.scratch.clone(), at)
             });
-        let (bounded, at) = match hit {
+        let blocked = if blocks() && kind != DISPATCH && max == 1 && count.is_none() {
+            self.clamped_block(list, &args, (offset, arguments), kind, as_indexed)
+        } else {
+            None
+        };
+        if kind == DISPATCH {
+            self.clamped.clear();
+        }
+        let compared = (block_test() & 4 != 0).then(|| blocked.clone()).flatten();
+        let blocked = if compared.is_some() { None } else { blocked };
+        let in_block = blocked.is_some();
+        if in_block && block_test() & 1 != 0 {
+            crate::list::wait_for_writes(list);
+        }
+        if in_block && block_test() & 16 != 0 {
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+        }
+        let (bounded, at) = match blocked.or(hit) {
             Some(hit) => hit,
             None => {
                 // A record a short step after the last window's last one
@@ -3178,6 +3428,9 @@ impl State {
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
+                if let Some((arena, at)) = &compared {
+                    block_compare(list, (arena, *at), &bounded, (kind, arguments, offset, as_indexed));
+                }
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
                 self.window = windowed.then(|| Window {
@@ -3206,7 +3459,9 @@ impl State {
             _ => false,
         };
         if !ran {
+            if !in_block {
             crate::indirect::done(list, &bounded);
+        }
             why("prepare failed");
             return false;
         }
@@ -3230,6 +3485,8 @@ impl State {
         }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
+        #[cfg(feature = "diagnostics")]
+        crate::span::span!("HOST ExecuteIndirect");
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
@@ -3249,7 +3506,9 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
+        if !in_block {
+            crate::indirect::done(list, &bounded);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -3336,6 +3595,8 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
+    #[cfg(feature = "diagnostics")]
+    crate::span::span!("readable");
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
@@ -3364,14 +3625,19 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            // (after the alias, which may make its host copy)
+            let side = crate::resource::host_side(*resource as This);
+            const TARGET_DEPTH_UNORDERED: u32 = 0x7;
             if !aliased
-                && let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
+                && let Some((copy, _)) = &side
+                && copy.flags & TARGET_DEPTH_UNORDERED == 0
             {
-                crate::texture::upload(list, *resource as This, t);
+                crate::texture::upload(list, *resource as This, &copy.texture);
             }
             // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(*resource as This, false, false);
+            if matches!(side, Some((_, true))) {
+                list.twin_use(*resource as This, false, false);
+            }
             // The depth target the draw only tests is read in both ways at
             // once: both read states, which its preparation asks for too.
             let (tested, _) = TESTED_DEPTH.get();
@@ -3381,7 +3647,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             } else {
                 SHADER_RESOURCE
             };
-            crate::list::ensure_state(list, *resource as This, state);
+            if let Some((copy, _)) = side {
+                crate::list::ensure_state_of(list, copy, state);
+            }
             #[cfg(feature = "diagnostics")]
             crate::capture::snap_note(*resource, state);
             #[cfg(feature = "diagnostics")]
@@ -3400,6 +3668,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            // Read by the title's CPU code: copied back into title memory.
+            list.texture_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);

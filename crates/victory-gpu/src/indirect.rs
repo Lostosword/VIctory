@@ -39,7 +39,9 @@ cbuffer Record : register(b0) {
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
     // run is left empty and costs nothing. Bit 2: draws counted by vertices
-    // leave as indexed ones (20-byte records).
+    // leave as indexed ones (20-byte records). Bit 3: the records are a
+    // whole block of the buffer, what is no record among them too: bounded
+    // one by one, none charged to the list's budget.
     uint has_count;
     uint count_offset;
 };
@@ -119,15 +121,17 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         // Diagnostics, in the budget buffer's next words: the largest
         // group count a mesh record asked for, and the groups asked in all.
-        uint was;
-        budget.InterlockedMax(4, g.x, was);
-        budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+        if ((has_count & 8u) == 0) {
+            uint was;
+            budget.InterlockedMax(4, g.x, was);
+            budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+        }
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128u;
         groups = g;
     }
     bool over = false;
-    if (cost > 0) {
+    if (cost > 0 && (has_count & 8u) == 0) {
         uint before;
         budget.InterlockedOr(0, 0, before);
         [allow_uav_condition]
@@ -279,6 +283,49 @@ pub(crate) fn bound_ahead(
     record_clamp_as(c, &list.list, &dst, budget, src, None, spec, flags).then_some(dst)
 }
 
+/// The bytes of argument buffers clamped in one pass by [`bound_block`].
+pub(crate) const BLOCK: u64 = 4096;
+
+/// How far apart a block's records are taken to be: the title keeps the
+/// ones it draws 16 bytes apart or a multiple of it.
+pub(crate) fn block_step(kind: u32) -> u64 {
+    if kind == 1 { 32 } else { 16 }
+}
+
+/// Clamps every record of a block of an argument buffer, `records` of them
+/// `step` apart from `src`, into room of their own in the list's arena, at
+/// the returned offset of the returned buffer, which is left to be read as
+/// arguments. Once in a block, the list's draws from it need no pass of
+/// ours, where one before each draw ends the render pass it is in: a card
+/// that draws by tiles loads and stores every target of the pass each time.
+pub(crate) fn bound_block(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    spec: (u32, u32, u32),
+    indexed: bool,
+) -> Option<(ID3D12Resource, u64)> {
+    #[cfg(feature = "diagnostics")]
+    crate::span::span!("bound_block");
+    let bytes = validate_layout(spec, src.1, None)?.max(scratch_bytes(spec, indexed));
+    let (c, budget) = (clamp()?, list.budget()?);
+    let (dst, at, armed) = list.indirect_arena(bytes.next_multiple_of(256))?;
+    let before = if armed { D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT } else { D3D12_RESOURCE_STATE_COMMON };
+    let flags = 2 | u32::from(indexed) << 2 | 8;
+    record_clamp_at(c, &list.list, (&dst, at, before), budget, src, None, spec, flags).then_some((dst, at))
+}
+
+/// Draws recorded from here on wait for what [`bound_block`] wrote.
+pub(crate) fn wait_for_block(list: &HostList, arena: &ID3D12Resource) {
+    #[cfg(feature = "diagnostics")]
+    crate::span::span!("wait_for_block");
+    let (args, write) = (D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // SAFETY: an open list and a live buffer in the argument state.
+    unsafe {
+        list.list.ResourceBarrier(&[transition(arena, args, write)]);
+        list.list.ResourceBarrier(&[uav_barrier(), transition(arena, write, args)]);
+    }
+}
+
 /// The size of the record an indexed draw takes, and the spacing of the
 /// records a clamp that makes indexed draws leaves.
 pub(crate) const INDEXED_RECORD: u32 = 20;
@@ -351,6 +398,21 @@ fn record_clamp_as(
     l: &ID3D12GraphicsCommandList,
     dst: &ID3D12Resource,
     budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    flags: u32,
+) -> bool {
+    record_clamp_at(c, l, (dst, 0, D3D12_RESOURCE_STATE_COMMON), budget, src, count, spec, flags)
+}
+
+/// [`record_clamp_as`] to an offset of a buffer in the state named.
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_at(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, dst_offset, before): (&ID3D12Resource, u64, D3D12_RESOURCE_STATES),
+    budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
@@ -364,7 +426,7 @@ fn record_clamp_as(
         return false;
     };
     // SAFETY: live D3D12 buffer resources.
-    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress() + dst_offset) };
     if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
         return false;
     }
@@ -416,7 +478,7 @@ fn record_clamp_as(
         uav_barrier(),
         transition(
             dst,
-            D3D12_RESOURCE_STATE_COMMON,
+            before,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         ),
     ];
